@@ -1,0 +1,13 @@
+venv/
+venv310/
+
+__pycache__/
+*.pyc
+
+temp_uploads/
+samples/
+HRMS-Portal-OCR-Extraction/
+.env
+
+output_*.json
+*.log
