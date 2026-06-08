@@ -3,8 +3,10 @@ import requests
 import json
 import re
 
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "phi4-mini"
+
 
 SCHEMAS = {
     "resume": {
@@ -47,6 +49,41 @@ SCHEMAS = {
     }
 }
 
+
+DEGREE_KEYWORDS = (
+    "b.e", "be ", "b.tech", "btech", "m.e", "me ", "m.tech", "mtech",
+    "b.sc", "bsc", "m.sc", "msc", "mba", "bca", "mca", "phd",
+    "bachelor", "master", "diploma", "degree", "nursing", "psychology",
+    "computer science", "engineering"
+)
+
+EDU_REJECT_WORDS = (
+    "experience", "work experience", "professional experience", "project",
+    "projects", "publication", "publications", "journal", "conference",
+    "paper presentation", "responsibilities", "declaration", "personal profile",
+    "dob", "date of birth", "nationality", "language", "languages", "hobbies",
+    "skills", "technical skills", "certification", "certifications"
+)
+
+EXP_REJECT_WORDS = (
+    "education", "languages", "hobbies", "certifications", "declaration",
+    "journal", "publication", "publications", "dissertation", "paper presentation",
+    "project completed", "participated in various events", "personal profile"
+)
+
+ROLE_WORDS = (
+    "engineer", "developer", "analyst", "consultant", "intern", "associate",
+    "manager", "lead", "professor", "instructor", "designer", "tester",
+    "administrator", "recruiter", "executive", "programmer"
+)
+
+COMPANY_HINTS = (
+    "ltd", "limited", "pvt", "private", "solutions", "technologies",
+    "systems", "services", "infotech", "college", "university", "hospital",
+    "company", "corp", "inc", "llp"
+)
+
+
 def preprocess_resume_text(text: str) -> str:
     """
     Normalize resume text before sending to LLM:
@@ -82,6 +119,7 @@ def _get_section(text: str, start_patterns, end_patterns):
 
     return "\n".join(lines[start_idx:end_idx]).strip()
 
+
 def extract_resume_sections(text: str) -> dict:
     text = preprocess_resume_text(text)
 
@@ -104,7 +142,7 @@ def extract_resume_sections(text: str) -> dict:
     skills_text = _slice_between_headings(
         text,
         start_names=(r"SUMMARY OF SKILLS", r"SKILLS", r"TECHNICAL SKILLS"),
-        end_names=(r"CONTACT", r"EDUCATION", r"EXPERIENCE", r"WORK EXPERIENCE", r"OBJECTIVE", r"ROLES AND RESPONSIBILITIES", r"AWARDS", r"CERTIFICATES", r"HOBBIES", r"INTEREST AND STRENGTHS",r"TECH STACK",r"CERTIFICATIONS")
+        end_names=(r"CONTACT", r"EDUCATION", r"EXPERIENCE", r"WORK EXPERIENCE", r"OBJECTIVE", r"ROLES AND RESPONSIBILITIES", r"AWARDS", r"CERTIFICATES", r"HOBBIES", r"INTEREST AND STRENGTHS", r"TECH STACK", r"CERTIFICATIONS")
     )
     result["skills"] = _extract_skills(skills_text) if skills_text else []
 
@@ -140,6 +178,7 @@ def extract_resume_sections(text: str) -> dict:
 
     return _normalize_resume_result(result)
 
+
 def _fallback_name_from_email_context(text: str, email: str | None) -> str | None:
     if not email:
         return None
@@ -166,6 +205,7 @@ def _fallback_name_from_email_context(text: str, email: str | None) -> str | Non
             return candidate
 
     return None
+
 
 def _extract_contact(text: str) -> dict:
     email_match = re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', text, re.IGNORECASE)
@@ -200,6 +240,7 @@ def _extract_contact(text: str) -> dict:
         if not (2 <= len(words) <= 4):
             return False
         return True
+
     name = None
 
     header_lines = []
@@ -250,6 +291,7 @@ def _is_heading(line: str) -> bool:
         or (len(words) <= 4 and all(w[0].isupper() for w in words if w[0].isalpha()))
     )
 
+
 def _slice_between_headings(text: str, start_names: tuple, end_names: tuple) -> str:
     lines = text.splitlines()
     start = None
@@ -267,6 +309,7 @@ def _slice_between_headings(text: str, start_names: tuple, end_names: tuple) -> 
                 end = j
                 break
     return "\n".join(lines[start:end]).strip()
+
 
 def _extract_skills(skills_text: str) -> list:
     text = re.sub(r'^[A-Za-z ]+:\s*', '', skills_text, flags=re.MULTILINE)
@@ -349,6 +392,8 @@ def _extract_skills(skills_text: str) -> list:
         low = s.lower()
         if low in NON_TECHNICAL:
             continue
+        if any(p in low for p in stop_phrases):
+            continue
         if low in SKILL_NORMALIZATION:
             s = SKILL_NORMALIZATION[low]
         reject_phrases = (
@@ -360,14 +405,14 @@ def _extract_skills(skills_text: str) -> list:
             words = {w.lower() for w in s.split()}
             if idx < 3 and not words.intersection(TECH_WORDS):
                 continue
-        if s.upper() in {"SKILLS",
+        if s.upper() in {
+            "SKILLS",
             "TECHNICAL SKILLS",
             "EDUCATION",
             "EXPERIENCE",
             "WORK EXPERIENCE"
         }:
             continue
-        
 
         s = re.sub(
             r'^(experience in|proficient in|working with)\s+',
@@ -390,6 +435,15 @@ def _extract_skills(skills_text: str) -> list:
     return list(dict.fromkeys(skills))
 
 
+def _looks_like_education_line(line: str) -> bool:
+    low = line.lower().strip()
+    if not low:
+        return False
+    if any(x in low for x in EDU_REJECT_WORDS):
+        return False
+    return any(k in low for k in DEGREE_KEYWORDS)
+
+
 def _extract_education(edu_text: str) -> list:
     entries = []
     lines = [l.strip() for l in edu_text.splitlines() if l.strip()]
@@ -398,7 +452,7 @@ def _extract_education(edu_text: str) -> list:
         line = lines[i]
 
         year_matches = re.findall(r'\b((?:19|20)\d{2})\b', line)
-        if year_matches:
+        if year_matches and _looks_like_education_line(line):
             year = year_matches[-1]
 
             degree = None
@@ -426,18 +480,21 @@ def _extract_education(edu_text: str) -> list:
             if institution is None and i + 1 < len(lines):
                 next_line = lines[i + 1]
                 if not re.search(r'\b((?:19|20)\d{2})\b', next_line):
-                    institution = re.sub(r',\s*[A-Za-z\s]+$', '', next_line).strip()
+                    if not any(x in next_line.lower() for x in EDU_REJECT_WORDS):
+                        institution = re.sub(r',\s*[A-Za-z\s]+$', '', next_line).strip()
 
             combined = f"{degree or ''} {institution or ''}".lower()
 
-
+            if any(x in combined for x in EDU_REJECT_WORDS):
+                i += 1
+                continue
             if re.search(r'\b(technologies|solutions|private limited|pvt|ltd|inc|consultant|freelancer|hcl|mindtree)\b', combined):
                 i += 1
                 continue
-            combined_low = combined.lower()
-            if "certification" in combined_low:
-                i+=1
+            if "certification" in combined:
+                i += 1
                 continue
+
             entries.append({
                 "degree": degree or None,
                 "institution": institution or None,
@@ -447,6 +504,7 @@ def _extract_education(edu_text: str) -> list:
         i += 1
 
     return entries
+
 
 def _looks_like_education(company, role) -> bool:
     combined = f"{company or ''} {role or ''}".lower()
@@ -474,6 +532,30 @@ def _looks_like_education(company, role) -> bool:
     score = sum(1 for k in keywords if k in combined)
     return score >= 2
 
+
+def _looks_like_company_or_role(text: str) -> bool:
+    low = (text or "").lower().strip()
+    if not low:
+        return False
+    return any(w in low for w in ROLE_WORDS) or any(h in low for h in COMPANY_HINTS)
+
+
+def _looks_like_sentence_fragment(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    if len(s.split()) > 10:
+        return True
+    if any(low.startswith(x) for x in (
+        "worked on", "involved in", "responsible for", "participated in",
+        "effectiveness of", "designed and", "developed and", "collaborated with",
+        "identified and", "conducted", "supported", "prepared"
+    )):
+        return True
+    return False
+
+
 def _extract_experience(exp_text: str) -> list:
     entries = []
     lines = [l.strip() for l in exp_text.splitlines() if l.strip()]
@@ -487,6 +569,8 @@ def _extract_experience(exp_text: str) -> list:
 
     for i, line in enumerate(lines):
         if line.startswith(('-', '•', '●', '')):
+            continue
+        if any(x in line.lower() for x in EXP_REJECT_WORDS):
             continue
 
         date_match = date_pattern.search(line)
@@ -504,7 +588,7 @@ def _extract_experience(exp_text: str) -> list:
 
         company = prefix or None
         role = None
-        
+
         if "|" in (prefix or ""):
             parts = [p.strip() for p in prefix.split("|") if p.strip()]
             if len(parts) >= 2:
@@ -521,6 +605,7 @@ def _extract_experience(exp_text: str) -> list:
                 prev
                 and not date_pattern.search(prev)
                 and not prev.startswith(('-', '•', '●', ''))
+                and not any(x in prev.lower() for x in EXP_REJECT_WORDS)
             ):
                 role = prev
 
@@ -528,14 +613,21 @@ def _extract_experience(exp_text: str) -> list:
 
         if _looks_like_education(company, role):
             continue
+
         if len(multi_matches) > 1:
             for company, role, duration in multi_matches:
+                if not (_looks_like_company_or_role(company) or _looks_like_company_or_role(role)):
+                    continue
                 entries.append({
                     "company": company.strip(),
                     "role": role.strip(),
                     "duration": duration.strip()
                 })
             continue
+
+        if not (_looks_like_company_or_role(company) or _looks_like_company_or_role(role)):
+            continue
+
         entries.append({
             "company": company or None,
             "role": role,
@@ -543,6 +635,7 @@ def _extract_experience(exp_text: str) -> list:
         })
 
     return _clean_experience_list(entries)
+
 
 def preprocess_payslip_text(text: str, page: int = -1) -> str:
     text = text.replace('■', '').replace('▪', '')
@@ -554,7 +647,7 @@ def preprocess_payslip_text(text: str, page: int = -1) -> str:
         flags=re.IGNORECASE
     )
     chunks = [c.strip() for c in chunks if c.strip() and len(c.strip()) > 100]
-    
+
     if len(chunks) > 1:
         text = chunks[page]
     known_labels = [
@@ -567,6 +660,7 @@ def preprocess_payslip_text(text: str, page: int = -1) -> str:
     pattern = r'(?<!\n)(' + '|'.join(re.escape(l) for l in known_labels) + r')(?=\s)'
     text = re.sub(pattern, r'\n\1', text)
     return text
+
 
 def _normalize_resume_result(result: dict) -> dict:
     for key in ("skills", "education", "experience"):
@@ -597,9 +691,10 @@ def _normalize_resume_result(result: dict) -> dict:
 def _normalize_education_list(edu_list: list) -> list:
     normalized = []
     degree_keywords = (
-        "b.e", "b.tech", "bsc", "b.sc", "bca", "m.e", "m.tech", "msc", "m.sc",
-        "mba", "bachelor", "master", "diploma", "certificate", "certification",
-        "phd", "doctorate"
+        "b.e", "be ", "b.tech", "btech", "m.e", "me ", "m.tech", "mtech",
+        "b.sc", "bsc", "m.sc", "msc", "mba", "bca", "mca", "phd",
+        "bachelor", "master", "diploma", "degree", "nursing", "psychology",
+        "computer science", "engineering"
     )
     company_keywords = (
         "technologies", "technology", "solutions", "private limited", "pvt", "ltd",
@@ -621,7 +716,6 @@ def _normalize_education_list(edu_list: list) -> list:
             if years:
                 year = max(years)
 
-        # If previous extraction put "Institution | Degree" in reversed order
         if degree and institution:
             deg_low = degree.lower()
             inst_low = institution.lower()
@@ -648,7 +742,7 @@ def _normalize_education_list(edu_list: list) -> list:
     return normalized
 
 
-def _clean_experience_list  (exp_list: list) -> list:
+def _clean_experience_list(exp_list: list) -> list:
     cleaned = []
 
     for entry in exp_list:
@@ -686,6 +780,20 @@ def _clean_experience_list  (exp_list: list) -> list:
 
         if not (company or role or duration):
             continue
+
+        combined_low = f"{company} {role}".lower()
+
+        if any(x in combined_low for x in EXP_REJECT_WORDS):
+            continue
+
+        if _looks_like_sentence_fragment(company) and not _looks_like_company_or_role(company):
+            continue
+
+        if _looks_like_sentence_fragment(role) and not _looks_like_company_or_role(role):
+            continue
+
+        if company and role and company.lower() == role.lower():
+            role = None
 
         cleaned.append({
             "company": company or None,
@@ -864,13 +972,13 @@ def extract_with_llm(raw_text: str, doc_type: str, **kwargs) -> dict:
     return result
 
 
-
 CHAR_LIMITS = {
     "resume": 5000,
     "payslip": 3000,
     "experience_letter": 2000,
     "degree_certificate": 2000,
 }
+
 
 def _call_llm(raw_text: str, doc_type: str, schema: dict, strict: bool = False) -> dict:
     char_limit = CHAR_LIMITS.get(doc_type, 3000)
@@ -935,6 +1043,7 @@ DOCUMENT TEXT:
     except Exception as e:
         return {"error": f"llm_error: {str(e)}"}
 
+
 def _call_llm_for_edu_exp(raw_text: str) -> dict:
     mini_schema = {
         "education": SCHEMAS["resume"]["education"],
@@ -981,6 +1090,7 @@ RESUME TEXT:
 
     except Exception:
         return {"education": [], "experience": []}
+
 
 def _parse_response(raw: str) -> dict:
     cleaned_raw = re.sub(r'(\d),(\d{3})\b', r'\1\2', raw)
