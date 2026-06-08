@@ -421,10 +421,6 @@ def extract_address(lines):
                 if not s.strip():
                     continue
 
-        print("ADDRESS LINE:", repr(s))
-        s = re.sub(r"\bVID\s*[:\-]?\s*\d[\d\s]{8,}\b", "", s, flags=re.IGNORECASE).strip()
-        address_lines.append(s)
-
         if (
             STATE_PIN_REGEX.search(s)
             or re.search(
