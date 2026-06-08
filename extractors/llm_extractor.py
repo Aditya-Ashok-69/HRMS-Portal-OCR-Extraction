@@ -22,8 +22,8 @@ SCHEMAS = {
     "payslip": {
         "employee_name": "string - name of the employee",
         "employee_id": "string - employee ID or staff number",
-        "employer_name": "string - company name, usually at the top of the document",
-        "pay_period": "string - the month and year this payslip covers",
+        "employer_name": "string - company/employer name. Usually appears at the very top of the payslip. Examples: Infosys Ltd, TCS, Cognizant Technology Solutions, HCL Technologies. Do NOT return employee name.",
+        "pay_period": "string - extract FULL pay period including month and year exactly as shown. Examples: 'March 2025', 'Apr 2024', '01-Mar-2025 to 31-Mar-2025'. Never return month only.",
         "gross_pay": "number - total earnings before deductions",
         "net_pay": "number - take-home pay after deductions",
         "basic_pay": "number - basic salary component",
@@ -759,6 +759,46 @@ def extract_with_llm(raw_text: str, doc_type: str, **kwargs) -> dict:
         }
 
     result["doc_type"] = doc_type
+    if doc_type == "payslip":
+
+        if not result.get("pay_period"):
+            m = re.search(
+                r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
+                r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|'
+                r'Nov(?:ember)?|Dec(?:ember)?)\s+((?:19|20)\d{2})',
+                raw_text,
+                re.IGNORECASE
+            )
+            if m:
+                result["pay_period"] = f"{m.group(1)} {m.group(2)}"
+
+        if not result.get("employer_name"):
+            lines = [
+                l.strip()
+                for l in raw_text.splitlines()
+                if l.strip()
+            ]
+
+            for line in lines[:15]:
+                if len(line) < 5:
+                    continue
+
+                if any(x in line.lower() for x in [
+                    "employee",
+                    "salary",
+                    "payslip",
+                    "pay slip",
+                    "gross pay",
+                    "net pay",
+                    "basic pay",
+                    "uan",
+                    "pan"
+                ]):
+                    continue
+
+                if re.search(r'[A-Za-z]', line):
+                    result["employer_name"] = line
+                    break
 
     # --------------------------------------------------
     # Resume-specific post processing
@@ -835,17 +875,37 @@ CHAR_LIMITS = {
 def _call_llm(raw_text: str, doc_type: str, schema: dict, strict: bool = False) -> dict:
     char_limit = CHAR_LIMITS.get(doc_type, 3000)
     text_chunk = raw_text[:char_limit]
-    
+
+    extra_rules = ""
+
+    if doc_type == "payslip":
+        extra_rules = """
+IMPORTANT:
+- employer_name is the company issuing the payslip.
+- employee_name is the employee receiving the payslip.
+- pay_period must include BOTH month and year.
+- If the document contains 'March 2025', return exactly 'March 2025'.
+- Do NOT return only 'March'.
+- employer_name is usually displayed at the top of the payslip.
+- Do NOT confuse employer_name with employee_name.
+"""
+
     if strict:
         prompt = f"""Extract fields from this {doc_type}.
 Return ONLY a JSON object. Start your response with {{ and end with }}.
 No explanation, no markdown, no extra text.
+
+{extra_rules}
+
 Fields: {json.dumps(schema)}
 
 TEXT:
 {text_chunk}"""
     else:
         prompt = f"""You are a document extraction system.
+
+{extra_rules}
+
 Extract fields from the following {doc_type} document.
 Return ONLY a valid JSON object with these fields:
 {json.dumps(schema, indent=2)}
