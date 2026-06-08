@@ -7,4 +7,13 @@ pypdfium2
 openbharatocr
 spacy
 python-docx
+requests
+pillow
+numpy
+opencv-python
+paddleocr
+pypdfium2
+openbharatocr
+spacy
+python-docx
 python-pptx

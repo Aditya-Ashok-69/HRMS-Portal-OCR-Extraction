@@ -112,6 +112,8 @@ ADDRESS_HARD_STOP_REGEX = re.compile(
     r"(?:^\d{10}$|"
     r"\b\d{2}/\d{2}/\d{4}\b|"
     r"\bYour\s+(?:Aadhaar\s+)?No\b|"
+    r"\b\d{4}\s\d{4}\s\d{4}\b|"
+    r"\b(?:uidai|uidal)\.gov\.in\b|"
     r"\bAadhaar\b.*\bissued\b|"
     r"\bDOB\b|"
     r"\bMALE\b|\bFEMALE\b|\bOTHER\b|"
@@ -253,6 +255,45 @@ def extract_name(lines):
 
     return None
 
+def extract_name_from_aadhaar_pdf(lines):
+
+    cleaned = [clean_line(x) for x in lines if clean_line(x)]
+
+    # Highest priority:
+    # Name immediately before DOB
+
+    for i, line in enumerate(cleaned):
+
+        if re.search(r"\bDOB\b", line, re.IGNORECASE):
+
+            for j in range(i - 1, max(-1, i - 5), -1):
+
+                cand = cleaned[j]
+
+                if is_valid_english_name(cand):
+
+                    if len(cand.split()) >= 2:
+
+                        return cand
+
+    # Name after TO
+
+    for i, line in enumerate(cleaned):
+
+        if line.strip().lower() == "to":
+
+            for j in range(i + 1, min(i + 6, len(cleaned))):
+
+                cand = cleaned[j]
+
+                if is_valid_english_name(cand):
+
+                    if len(cand.split()) >= 2:
+
+                        return cand
+
+    return None
+
 def is_valid_english_name(line: str) -> bool:
     s = clean_line(line)
     if not s:
@@ -285,7 +326,9 @@ def is_valid_english_name(line: str) -> bool:
             good += 1
         elif re.fullmatch(r"[A-Z]", w):
             good += 1
-
+    if len(words) == 2:
+        if len(words[0]) <= 3 and len(words[1]) <= 3:
+            return False
     return good >= 1
 
 def extract_dob(text: str):
@@ -375,14 +418,53 @@ def extract_address(lines):
 
     for line in lines:
         s = clean_line(line)
-        s = re.sub(r"\bVID\s*[:\-]?\s*\d[\d\s]{8,}\b", "", s, flags=re.IGNORECASE)
-        s = re.sub(r"\bVID\s*[:\-]?\s*", "", s, flags=re.IGNORECASE)
+
+        s = re.sub(
+            r"\bVID\s*[:\-]?\s*\d[\d\s]{8,}\b",
+            "",
+            s,
+            flags=re.IGNORECASE
+        )
+        s = re.sub(
+            r"\bVID\s*[:\-]?\s*",
+            "",
+            s,
+            flags=re.IGNORECASE
+        )
+
         if not s:
             continue
 
-        if not collecting and re.search(r"\bAddress\b", s, re.IGNORECASE):
+        # Start only from Address section
+        if not collecting and re.search(
+            r"^\s*Address\s*:?",
+            s,
+            re.IGNORECASE
+        ):
             collecting = True
             address_lines = []
+
+            # Handle:
+            # Address:S/O:Kuppan,NO
+            s = re.sub(
+                r"^\s*Address\s*:?",
+                "",
+                s,
+                flags=re.IGNORECASE
+            ).strip()
+
+            if s:
+                if re.match(r"^(S/O|D/O|C/O|W/O)", s, re.IGNORECASE):
+                    s = re.sub(
+                        r"^(?:S/O|D/O|C/O|W/O)\s*:?\s*[^,]+,\s*",
+                        "",
+                        s,
+                        flags=re.IGNORECASE
+                    )
+
+                if s:
+                    address_lines.append(s)
+
             continue
 
         if not collecting:
@@ -391,42 +473,53 @@ def extract_address(lines):
         if ADDRESS_HARD_STOP_REGEX.search(s):
             break
 
-
         s = re.sub(r"\s+", " ", s).strip(" ,.-")
+
         if not s:
             continue
 
-        # Handle relationship/address merged lines
+        # OCR garbage
+        if s.lower() in {"mq", "q", "oq"}:
+            continue
+
+        if re.fullmatch(r"[A-Za-z]{1,2}\.?", s):
+            continue
+
+        # Remove S/O father-name prefix
         if re.match(r"^(S/O|D/O|C/O|W/O)\b", s, re.IGNORECASE):
-            s = re.sub(r"^(S/O|D/O|C/O|W/O)\s*:?\s*[^,]+,?\s*", "", s, flags=re.IGNORECASE)
-            hno_match = re.search(
-                r"(H\.?\s*No\.?.*)",
+            s = re.sub(
+                r"^(?:S/O|D/O|C/O|W/O)\s*:?\s*[^,]+,\s*",
+                "",
                 s,
                 flags=re.IGNORECASE
             )
 
-            if hno_match:
-                s = hno_match.group(1)
+            if not s.strip():
+                continue
 
-            else:
-                # Example:
-                # S/O: Velmurugan, 2/281 K, ADITHYA ILLAM...
-                s = re.sub(
-                    r"^(?:S/O|D/O|C/O|W/O)\s*:\s*[^,]+,\s*",
-                    "",
-                    s,
-                    flags=re.IGNORECASE
-                )
+        # Merge:
+        # NO
+        if (
+            address_lines
+            and address_lines[-1].upper() == "NO"
+            and re.match(r"^\d+", s)
+        ):
+            address_lines[-1] = address_lines[-1] + s
+            continue
 
-                if not s.strip():
-                    continue
+        address_lines.append(s)
 
+        # Stop after state+pincode line
         if (
             STATE_PIN_REGEX.search(s)
             or re.search(
                 r"\bPIN\s*Code\s*[:\-]?\s*\d{6}\b",
                 s,
                 re.IGNORECASE
+            )
+            or re.search(
+                r"\b[A-Za-z ]+\s*-\s*\d{6}\b",
+                s
             )
         ):
             break
@@ -435,11 +528,22 @@ def extract_address(lines):
         return None
 
     address = ", ".join(address_lines)
+
+    # Remove locality duplication seen in OCR
+    address = re.sub(
+        r"\bVengathur\s*,?\s*Manavalanagar\b",
+        "",
+        address,
+        flags=re.IGNORECASE
+    )
+
     address = re.sub(r"\s*,\s*", ", ", address)
     address = re.sub(r",\s*,+", ", ", address)
-    address = re.sub(r"\s+", " ", address).strip(" ,.-")
+    address = re.sub(r"\s+", " ", address)
 
-    return address or None
+    address = address.strip(" ,.-")
+
+    return address if address else None
 
 def remove_relationship_prefix(address: str) -> str:
     if not address:
@@ -453,6 +557,48 @@ def remove_relationship_prefix(address: str) -> str:
     )
 
     return re.sub(r"\s+", " ", address).strip()
+
+def clean_aadhaar_address(address):
+    if not address:
+        return address
+
+    address = re.sub(
+        r"\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b",
+        "",
+        address
+    )
+
+    address = re.sub(
+        r"\b\d{9,}\b",
+        "",
+        address
+    )
+
+    address = re.sub(
+        r"\b(?:uidai|uidal)\.gov\.in\b",
+        "",
+        address,
+        flags=re.IGNORECASE
+    )
+
+    address = re.sub(
+        r"\b\d{6}\s+\d+\b",
+        "",
+        address
+    )
+
+    address = re.sub(
+        r"\b(?:S/O|D/O|C/O|W/O)\s*:?\s*[^,]+,?",
+        "",
+        address,
+        flags=re.IGNORECASE
+    )
+
+    address = re.sub(r"\s+", " ", address)
+
+    address = re.sub(r"\s*,\s*", ", ", address)
+
+    return address.strip(" ,.-")
 
 def is_valid_ddmmyyyy(candidate: str):
     if not re.fullmatch(r"\d{8}", candidate):
@@ -1262,34 +1408,63 @@ def extract_from_aadhaar_pdf(pdf_path: str):
     lines = [line for line in raw_text.splitlines() if line.strip()]
 
     # -----------------------------
-    # Aadhaar extraction (FIXED)
+    # Aadhaar extraction
     # -----------------------------
-    clean_text = re.sub(r"VID\s*[:\-]?\s*\d[\d\s]{12,}", "", raw_text, flags=re.IGNORECASE)
-    aadhaar_candidates = re.findall(r"\d{4}\s?\d{4}\s?\d{4}", clean_text)
+    clean_text = re.sub(
+        r"VID\s*[:\-]?\s*\d[\d\s]{12,}",
+        "",
+        raw_text,
+        flags=re.IGNORECASE
+    )
+
+    aadhaar_candidates = re.findall(
+        r"\d{4}\s?\d{4}\s?\d{4}",
+        clean_text
+    )
+
+    # keep only valid 12-digit candidates
+    aadhaar_candidates = [
+        c
+        for c in aadhaar_candidates
+        if re.fullmatch(r"\d{12}", re.sub(r"\D", "", c))
+    ]
 
     aadhaar = None
-    best_score = 0
+    best_score = -1
 
     for cand in aadhaar_candidates:
+
         digits = re.sub(r"\D", "", cand)
 
-        # strict validation
-        if len(digits) != 12:
-            continue
-
-        # reject obvious invalid patterns
+        # Aadhaar never starts with 0 or 1
         if digits[0] in "01":
             continue
-        if re.search(rf"VID\s*.*{digits}", raw_text, re.IGNORECASE):
-            continue
 
-        # score based on frequency + presence quality
-        score = (
-            raw_text.count(cand) * 2 +
-            raw_text.count(digits)
-        )
-        if "DOB" in raw_text or "Address" in raw_text:
-            score += 1
+        score = 0
+
+        # strongest signal:
+        # Aadhaar number appearing near Aadhaar label
+        if re.search(
+            rf"(?:Your\s+Aadhaar\s+No|Aadhaar\s+No|Aadhaar)[^\d]{{0,40}}{re.escape(cand)}",
+            raw_text,
+            re.IGNORECASE | re.DOTALL
+        ):
+            score += 20
+
+        # appears multiple times
+        score += raw_text.count(cand) * 3
+
+        # appears as plain digits too
+        score += raw_text.count(digits)
+
+        # appears near DOB section
+        if re.search(
+            rf"DOB.*?{re.escape(cand)}",
+            raw_text,
+            re.IGNORECASE | re.DOTALL
+        ):
+            score += 5
+
         if score > best_score:
             best_score = score
             aadhaar = f"{digits[:4]} {digits[4:8]} {digits[8:]}"
@@ -1305,7 +1480,7 @@ def extract_from_aadhaar_pdf(pdf_path: str):
     # -----------------------------
     # Name / DOB / Gender
     # -----------------------------
-    name = extract_name(lines)
+    name = extract_name_from_aadhaar_pdf(lines)
     dob = extract_dob(raw_text)
     gender = extract_gender(raw_text)
 
@@ -1315,6 +1490,7 @@ def extract_from_aadhaar_pdf(pdf_path: str):
     address = extract_address(lines)
     if address:
         address = remove_relationship_prefix(address)
+        address = clean_aadhaar_address(address)
 
     # -----------------------------
     # Final validation (extra safety)
