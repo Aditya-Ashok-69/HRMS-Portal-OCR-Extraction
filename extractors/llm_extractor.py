@@ -2,10 +2,24 @@
 import requests
 import json
 import re
+from datetime import datetime
+from dateutil.relativedelta import relativedelta  # pip install python-dateutil
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "phi4-mini"
 
+# -----------------------------------------------------------------------
+# UAN regex — 12-digit number preceded by "UAN" label.
+# Handles: "UAN: 123456789012", "UAN No 123456789012", "UAN\t123456789012"
+# -----------------------------------------------------------------------
+UAN_REGEX = re.compile(
+    r"\bUAN(?:\s*(?:No\.?|Number|#))?\s*[:\-]?\s*(\d{12})\b",
+    re.IGNORECASE
+)
+
+# -----------------------------------------------------------------------
+# Schemas — only fields we actually need per doc type
+# -----------------------------------------------------------------------
 SCHEMAS = {
     "resume": {
         "name": "string - full name of the candidate",
@@ -17,18 +31,10 @@ SCHEMAS = {
             "institution": "string - university or college name",
             "year": "string - graduation year only e.g. 2020 or June 2020, not the full date range"}],
         "experience": [{"company": "string", "role": "string", "duration": "string"}],
-        "total_experience_years": "number or null"
+        "total_experience_years": "number or null - IT/software experience ONLY"
     },
     "payslip": {
-        "employee_name": "string - name of the employee",
-        "employee_id": "string - employee ID or staff number",
-        "employer_name": "string - company/employer name. Usually appears at the very top of the payslip. Examples: Infosys Ltd, TCS, Cognizant Technology Solutions, HCL Technologies. Do NOT return employee name.",
-        "pay_period": "string - extract FULL pay period including month and year exactly as shown. Examples: 'March 2025', 'Apr 2024', '01-Mar-2025 to 31-Mar-2025'. Never return month only.",
-        "gross_pay": "number - total earnings before deductions",
-        "net_pay": "number - take-home pay after deductions",
-        "basic_pay": "number - basic salary component",
-        "pan": "string or null",
-        "uan": "string - Universal Account Number"
+        "uan": "string - Universal Account Number, exactly 12 digits"
     },
     "experience_letter": {
         "employee_name": "string",
@@ -47,13 +53,241 @@ SCHEMAS = {
     }
 }
 
+CHAR_LIMITS = {
+    "resume": 5000,
+    "payslip": 3000,
+    "experience_letter": 2000,
+    "degree_certificate": 2000,
+}
+
+
+# -----------------------------------------------------------------------
+# UAN extraction — regex first, LLM only as fallback
+# -----------------------------------------------------------------------
+def extract_uan_from_text(text: str) -> str | None:
+    """Try regex first. Returns 12-digit UAN string or None."""
+    m = UAN_REGEX.search(text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def extract_uan_with_llm(raw_text: str) -> str | None:
+    """LLM fallback when regex found nothing."""
+    prompt = f"""Extract the UAN (Universal Account Number) from this payslip.
+UAN is always exactly 12 digits and is labeled 'UAN' or 'UAN No'.
+
+Return ONLY a JSON object: {{"uan": "123456789012"}} or {{"uan": null}} if not found.
+No explanation, no markdown.
+
+PAYSLIP TEXT:
+{raw_text[:2000]}"""
+
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={"model": MODEL, "prompt": prompt, "stream": False},
+            timeout=60
+        )
+        response.raise_for_status()
+        parsed = _parse_response(response.json()["response"])
+        val = parsed.get("uan")
+        # Validate it's actually 12 digits
+        if val and re.fullmatch(r"\d{12}", str(val).strip()):
+            return str(val).strip()
+        return None
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------------
+# IT experience calculation
+# -----------------------------------------------------------------------
+
+# Keywords that identify IT / software roles
+_IT_ROLE_KEYWORDS = re.compile(
+    r"\b("
+    r"software|developer|engineer|programmer|devops|data\s*scientist|"
+    r"data\s*analyst|machine\s*learning|ml\s*engineer|ai\s*engineer|"
+    r"backend|frontend|full[\s-]?stack|cloud|sre|qa|quality\s*assurance|"
+    r"test\s*engineer|mobile\s*developer|android|ios\s*developer|"
+    r"database\s*admin|dba|system\s*admin|network\s*engineer|"
+    r"it\s*support|technical\s*support|solutions\s*architect|"
+    r"scrum|agile|product\s*manager|tech\s*lead|engineering\s*manager"
+    r")\b",
+    re.IGNORECASE
+)
+
+# Keywords that clearly indicate NON-IT roles
+_NON_IT_ROLE_KEYWORDS = re.compile(
+    r"\b("
+    r"civil\s*engineer|structural|construction|site\s*engineer|"
+    r"teacher|professor|lecturer|doctor|nurse|accountant|"
+    r"sales\s*executive|marketing|retail|store\s*manager|"
+    r"driver|operator|technician|electrician|plumber|mechanic"
+    r")\b",
+    re.IGNORECASE
+)
+
+
+def _parse_duration_to_months(duration: str) -> int | None:
+    """
+    Parse a duration string like:
+      "Jan 2021 - Mar 2023"
+      "2020 - Present"
+      "June 2019 – Current"
+      "2 years 3 months"
+    Returns total months or None if unparseable.
+    """
+    if not duration:
+        return None
+    if isinstance(duration, list):
+        duration = " - ".join(str(x) for x in duration if x)
+    elif not isinstance(duration, str):
+        duration = str(duration)
+
+    duration = duration.strip()
+
+    # "X years Y months" / "X years" / "Y months"
+    m = re.match(
+        r"(\d+)\s*years?\s*(?:(\d+)\s*months?)?",
+        duration,
+        re.IGNORECASE
+    )
+    if m:
+        y = int(m.group(1))
+        mo = int(m.group(2)) if m.group(2) else 0
+        return y * 12 + mo
+
+    # Date range patterns
+    month_map = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+    }
+
+    # Regex for "Mon YYYY – Mon YYYY/Present"
+    range_pat = re.compile(
+        r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?)\s*(\d{4})"
+        r"\s*[-–]\s*"
+        r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{4}|Present|Current|Now)",
+        re.IGNORECASE
+    )
+    rm = range_pat.search(duration)
+    if rm:
+        start_mon = month_map.get(rm.group(1)[:3].lower(), 1)
+        start_year = int(rm.group(2))
+        end_str = rm.group(3).strip().lower()
+        if end_str in ("present", "current", "now"):
+            end_dt = datetime.today()
+        else:
+            ep = re.match(
+                r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*(\d{4})",
+                end_str,
+                re.IGNORECASE
+            )
+            if ep:
+                end_dt = datetime(int(ep.group(2)), month_map.get(ep.group(1)[:3].lower(), 1), 1)
+            else:
+                return None
+        start_dt = datetime(start_year, start_mon, 1)
+        diff = relativedelta(end_dt, start_dt)
+        return diff.years * 12 + diff.months
+
+    # "YYYY – YYYY" or "YYYY – Present"
+    year_pat = re.compile(
+        r"(\d{4})\s*[-–]\s*(\d{4}|Present|Current)",
+        re.IGNORECASE
+    )
+    ym = year_pat.search(duration)
+    if ym:
+        start_y = int(ym.group(1))
+        end_str = ym.group(2).strip().lower()
+        end_y = datetime.today().year if end_str in ("present", "current") else int(end_str)
+        return max(0, (end_y - start_y) * 12)
+
+    return None
+
+
+def _calculate_it_experience_from_entries(experience: list[dict]) -> float | None:
+    """
+    Given a list of experience dicts {company, role, duration},
+    sum months for roles that look like IT roles.
+    """
+    total_months = 0
+    found_any = False
+
+    for entry in experience:
+        role = entry.get("role") or ""
+        company = entry.get("company") or ""
+        duration = entry.get("duration") or ""
+
+        combined = f"{role} {company}"
+
+        # Skip if explicitly non-IT
+        if _NON_IT_ROLE_KEYWORDS.search(combined):
+            continue
+
+        # Only count if role looks like IT
+        if not _IT_ROLE_KEYWORDS.search(combined):
+            # Ambiguous — if company name gives no signal, skip conservatively
+            continue
+
+        months = _parse_duration_to_months(duration)
+        if months is not None and months > 0:
+            total_months += months
+            found_any = True
+
+    if not found_any:
+        return None
+
+    # Round to 1 decimal (e.g. 14 months → 1.2 years)
+    return round(total_months / 12, 1)
+
+
+def _calculate_it_experience_with_llm(exp_text: str) -> float | None:
+    """
+    LLM fallback for IT experience calculation when regex parsing fails.
+    Only called when structured entries couldn't be parsed from duration strings.
+    """
+    if not exp_text or not exp_text.strip():
+        return None
+
+    prompt = f"""You are a resume parser.
+
+Given the EXPERIENCE section below, calculate the total years the candidate has worked
+in IT / software / technology roles ONLY.
+
+Rules:
+- Count: software developer, data scientist, ML engineer, backend/frontend engineer,
+  DevOps, cloud, QA, IT support, data analyst, and similar tech roles.
+- Do NOT count: civil engineering, construction, teaching non-tech subjects, sales,
+  marketing, or any non-IT domain.
+- If duration is given as date ranges (e.g. "Jan 2022 - Mar 2024"), calculate the difference.
+- If duration is stated explicitly (e.g. "2 years 3 months"), use that.
+- Return ONLY: {{"it_experience_years": 3.5}} or {{"it_experience_years": null}} if none found.
+- No explanation, no markdown.
+
+EXPERIENCE SECTION:
+{exp_text[:2000]}"""
+
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={"model": MODEL, "prompt": prompt, "stream": False},
+            timeout=60
+        )
+        response.raise_for_status()
+        parsed = _parse_response(response.json()["response"])
+        val = parsed.get("it_experience_years")
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------------
+# Resume helpers (unchanged from original)
+# -----------------------------------------------------------------------
 def preprocess_resume_text(text: str) -> str:
-    """
-    Normalize resume text before sending to LLM:
-    - Replace bullet characters with newline + dash
-    - Normalize whitespace
-    - Keep structure readable
-    """
     text = re.sub(r'[●•◆▪■◦‣⁃]', '\n- ', text)
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     text = re.sub(r'\n{3,}', '\n\n', text)
@@ -104,7 +338,10 @@ def extract_resume_sections(text: str) -> dict:
     skills_text = _slice_between_headings(
         text,
         start_names=(r"SUMMARY OF SKILLS", r"SKILLS", r"TECHNICAL SKILLS"),
-        end_names=(r"CONTACT", r"EDUCATION", r"EXPERIENCE", r"WORK EXPERIENCE", r"OBJECTIVE", r"ROLES AND RESPONSIBILITIES", r"AWARDS", r"CERTIFICATES", r"HOBBIES", r"INTEREST AND STRENGTHS",r"TECH STACK",r"CERTIFICATIONS")
+        end_names=(r"CONTACT", r"EDUCATION", r"EXPERIENCE", r"WORK EXPERIENCE",
+                   r"OBJECTIVE", r"ROLES AND RESPONSIBILITIES", r"AWARDS",
+                   r"CERTIFICATES", r"HOBBIES", r"INTEREST AND STRENGTHS",
+                   r"TECH STACK", r"CERTIFICATIONS")
     )
     result["skills"] = _extract_skills(skills_text) if skills_text else []
 
@@ -113,8 +350,10 @@ def extract_resume_sections(text: str) -> dict:
 
     exp_text = _slice_between_headings(
         text,
-        start_names=(r"EXPERIENCE", r"WORK EXPERIENCE", r"PROFESSIONAL EXPERIENCE", r"ROLES AND RESPONSIBILITIES"),
-        end_names=(r"SKILLS", r"SUMMARY OF SKILLS", r"EDUCATION", r"AWARDS", r"CERTIFICATES", r"HOBBIES")
+        start_names=(r"EXPERIENCE", r"WORK EXPERIENCE", r"PROFESSIONAL EXPERIENCE",
+                     r"ROLES AND RESPONSIBILITIES"),
+        end_names=(r"SKILLS", r"SUMMARY OF SKILLS", r"EDUCATION", r"AWARDS",
+                   r"CERTIFICATES", r"HOBBIES")
     )
     exp_list = _extract_experience(exp_text) if exp_text else []
 
@@ -126,19 +365,17 @@ def extract_resume_sections(text: str) -> dict:
 
     result["education"] = edu_list or []
     result["experience"] = exp_list or []
-    exp_match = re.search(
-        r'(\d+)\+?\s*Years',
-        text,
-        re.IGNORECASE
-    )
-    result["total_experience_years"] = (
-        int(exp_match.group(1))
-        if exp_match
-        else None
-    )
-    result["doc_type"] = "resume"
 
+    # FIXED: IT-only experience calculation — try structured parsing first
+    it_years = _calculate_it_experience_from_entries(result["experience"])
+    if it_years is None and exp_text:
+        # Fallback to LLM only when structured parsing yielded nothing
+        it_years = _calculate_it_experience_with_llm(exp_text)
+    result["total_experience_years"] = it_years
+
+    result["doc_type"] = "resume"
     return _normalize_resume_result(result)
+
 
 def _fallback_name_from_email_context(text: str, email: str | None) -> str | None:
     if not email:
@@ -166,6 +403,7 @@ def _fallback_name_from_email_context(text: str, email: str | None) -> str | Non
             return candidate
 
     return None
+
 
 def _extract_contact(text: str) -> dict:
     email_match = re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', text, re.IGNORECASE)
@@ -200,6 +438,7 @@ def _extract_contact(text: str) -> dict:
         if not (2 <= len(words) <= 4):
             return False
         return True
+
     name = None
 
     header_lines = []
@@ -250,6 +489,7 @@ def _is_heading(line: str) -> bool:
         or (len(words) <= 4 and all(w[0].isupper() for w in words if w[0].isalpha()))
     )
 
+
 def _slice_between_headings(text: str, start_names: tuple, end_names: tuple) -> str:
     lines = text.splitlines()
     start = None
@@ -268,10 +508,11 @@ def _slice_between_headings(text: str, start_names: tuple, end_names: tuple) -> 
                 break
     return "\n".join(lines[start:end]).strip()
 
+
 def _extract_skills(skills_text: str) -> list:
     text = re.sub(r'^[A-Za-z ]+:\s*', '', skills_text, flags=re.MULTILINE)
     text = (
-        text.replace('', '\n')
+        text.replace('', '\n')
             .replace('•', '\n')
             .replace('●', '\n')
             .replace('▪', '\n')
@@ -292,19 +533,6 @@ def _extract_skills(skills_text: str) -> list:
     items = re.split(r'[,\n;]+', text)
     skills = []
 
-    stop_phrases = (
-        "ability to",
-        "experience in",
-        "experience leading",
-        "good exposure",
-        "excellent",
-        "familiarity",
-        "working with",
-        "deep understanding",
-        "proficient in",
-        "developing",
-        "having professional"
-    )
     NON_TECHNICAL = {
         "research",
         "professional teaching",
@@ -320,26 +548,10 @@ def _extract_skills(skills_text: str) -> list:
         "roles and responsibilities"
     )
     TECH_WORDS = {
-        "architecture",
-        "integration",
-        "database",
-        "serverless",
-        "control",
-        "security",
-        "deployment",
-        "monitoring",
-        "logging",
-        "api",
-        "aws",
-        "python",
-        "devops",
-        "framework",
-        "testing",
-        "automation",
-        "cloud",
-        "microservices",
-        "docker",
-        "kubernetes"
+        "architecture", "integration", "database", "serverless", "control",
+        "security", "deployment", "monitoring", "logging", "api", "aws",
+        "python", "devops", "framework", "testing", "automation", "cloud",
+        "microservices", "docker", "kubernetes"
     }
 
     for idx, item in enumerate(items):
@@ -351,31 +563,20 @@ def _extract_skills(skills_text: str) -> list:
             continue
         if low in SKILL_NORMALIZATION:
             s = SKILL_NORMALIZATION[low]
-        reject_phrases = (
-            "development program",
-        )
-        if any(p in low for p in reject_phrases):
+        if any(p in low for p in ("development program",)):
             continue
         if re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", s):
             words = {w.lower() for w in s.split()}
             if idx < 3 and not words.intersection(TECH_WORDS):
                 continue
-        if s.upper() in {"SKILLS",
-            "TECHNICAL SKILLS",
-            "EDUCATION",
-            "EXPERIENCE",
-            "WORK EXPERIENCE"
-        }:
+        if s.upper() in {"SKILLS", "TECHNICAL SKILLS", "EDUCATION", "EXPERIENCE", "WORK EXPERIENCE"}:
             continue
-        
-
         s = re.sub(
             r'^(experience in|proficient in|working with)\s+',
             '',
             s,
             flags=re.IGNORECASE
         )
-
         if any(w in low for w in reject_words):
             continue
         if len(s.split()) > 5:
@@ -384,7 +585,6 @@ def _extract_skills(skills_text: str) -> list:
             continue
         if s.endswith('.') or s.endswith(',') or s.endswith(':'):
             continue
-
         skills.append(s)
 
     return list(dict.fromkeys(skills))
@@ -430,13 +630,11 @@ def _extract_education(edu_text: str) -> list:
 
             combined = f"{degree or ''} {institution or ''}".lower()
 
-
             if re.search(r'\b(technologies|solutions|private limited|pvt|ltd|inc|consultant|freelancer|hcl|mindtree)\b', combined):
                 i += 1
                 continue
-            combined_low = combined.lower()
-            if "certification" in combined_low:
-                i+=1
+            if "certification" in combined.lower():
+                i += 1
                 continue
             entries.append({
                 "degree": degree or None,
@@ -448,31 +646,19 @@ def _extract_education(edu_text: str) -> list:
 
     return entries
 
+
 def _looks_like_education(company, role) -> bool:
     combined = f"{company or ''} {role or ''}".lower()
 
     keywords = (
-        "university",
-        "college",
-        "school",
-        "institute",
-        "certification",
-        "certificate",
-        "course",
-        "b.e",
-        "b.tech",
-        "m.e",
-        "m.tech",
-        "b.sc",
-        "m.sc",
-        "mba",
-        "diploma",
-        "bca",
-        "mca"
+        "university", "college", "school", "institute", "certification",
+        "certificate", "course", "b.e", "b.tech", "m.e", "m.tech",
+        "b.sc", "m.sc", "mba", "diploma", "bca", "mca"
     )
 
     score = sum(1 for k in keywords if k in combined)
     return score >= 2
+
 
 def _extract_experience(exp_text: str) -> list:
     entries = []
@@ -486,7 +672,7 @@ def _extract_experience(exp_text: str) -> list:
     )
 
     for i, line in enumerate(lines):
-        if line.startswith(('-', '•', '●', '')):
+        if line.startswith(('-', '•', '●', '')):
             continue
 
         date_match = date_pattern.search(line)
@@ -504,7 +690,7 @@ def _extract_experience(exp_text: str) -> list:
 
         company = prefix or None
         role = None
-        
+
         if "|" in (prefix or ""):
             parts = [p.strip() for p in prefix.split("|") if p.strip()]
             if len(parts) >= 2:
@@ -520,7 +706,7 @@ def _extract_experience(exp_text: str) -> list:
             elif (
                 prev
                 and not date_pattern.search(prev)
-                and not prev.startswith(('-', '•', '●', ''))
+                and not prev.startswith(('-', '•', '●', ''))
             ):
                 role = prev
 
@@ -544,6 +730,7 @@ def _extract_experience(exp_text: str) -> list:
 
     return _clean_experience_list(entries)
 
+
 def preprocess_payslip_text(text: str, page: int = -1) -> str:
     text = text.replace('■', '').replace('▪', '')
     text = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -554,7 +741,7 @@ def preprocess_payslip_text(text: str, page: int = -1) -> str:
         flags=re.IGNORECASE
     )
     chunks = [c.strip() for c in chunks if c.strip() and len(c.strip()) > 100]
-    
+
     if len(chunks) > 1:
         text = chunks[page]
     known_labels = [
@@ -567,6 +754,7 @@ def preprocess_payslip_text(text: str, page: int = -1) -> str:
     pattern = r'(?<!\n)(' + '|'.join(re.escape(l) for l in known_labels) + r')(?=\s)'
     text = re.sub(pattern, r'\n\1', text)
     return text
+
 
 def _normalize_resume_result(result: dict) -> dict:
     for key in ("skills", "education", "experience"):
@@ -621,7 +809,6 @@ def _normalize_education_list(edu_list: list) -> list:
             if years:
                 year = max(years)
 
-        # If previous extraction put "Institution | Degree" in reversed order
         if degree and institution:
             deg_low = degree.lower()
             inst_low = institution.lower()
@@ -648,7 +835,7 @@ def _normalize_education_list(edu_list: list) -> list:
     return normalized
 
 
-def _clean_experience_list  (exp_list: list) -> list:
+def _clean_experience_list(exp_list: list) -> list:
     cleaned = []
 
     for entry in exp_list:
@@ -709,193 +896,17 @@ def _clean_experience_list  (exp_list: list) -> list:
     return deduped
 
 
-def extract_with_llm(raw_text: str, doc_type: str, **kwargs) -> dict:
-    schema = SCHEMAS.get(doc_type)
-    if not schema:
-        return {
-            "doc_type": doc_type,
-            "error": f"No schema defined for doc_type: {doc_type}"
-        }
-
-    parsed = None
-
-    # --------------------------------------------------
-    # Resume: try regex extraction first
-    # --------------------------------------------------
-    if doc_type == "resume":
-        parsed = extract_resume_sections(raw_text)
-
-        complete_regex = (
-            parsed.get("name")
-            and parsed.get("email")
-            and parsed.get("phone")
-            and parsed.get("skills")
-            and parsed.get("education")
-            and parsed.get("experience")
-        )
-        if complete_regex:
-            parsed["doc_type"] = "resume"
-            return _normalize_resume_result(parsed)
-
-    # --------------------------------------------------
-    # Payslip preprocessing
-    # --------------------------------------------------
-    if doc_type == "payslip":
-        page = kwargs.get("page", -1)
-        raw_text = preprocess_payslip_text(raw_text, page=page)
-
-    # --------------------------------------------------
-    # Main LLM extraction
-    # --------------------------------------------------
-    result = _call_llm(raw_text, doc_type, schema)
-
-    if isinstance(result, dict) and result.get("error") == "parse_failed":
-        result = _call_llm(raw_text, doc_type, schema, strict=True)
-
-    if not isinstance(result, dict):
-        return {
-            "doc_type": doc_type,
-            "error": "llm_returned_non_dict"
-        }
-
-    result["doc_type"] = doc_type
-    if doc_type == "payslip":
-
-        if not result.get("pay_period"):
-            m = re.search(
-                r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
-                r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|'
-                r'Nov(?:ember)?|Dec(?:ember)?)\s+((?:19|20)\d{2})',
-                raw_text,
-                re.IGNORECASE
-            )
-            if m:
-                result["pay_period"] = f"{m.group(1)} {m.group(2)}"
-
-        if not result.get("employer_name"):
-            lines = [
-                l.strip()
-                for l in raw_text.splitlines()
-                if l.strip()
-            ]
-
-            for line in lines[:15]:
-                if len(line) < 5:
-                    continue
-
-                if any(x in line.lower() for x in [
-                    "employee",
-                    "salary",
-                    "payslip",
-                    "pay slip",
-                    "gross pay",
-                    "net pay",
-                    "basic pay",
-                    "uan",
-                    "pan"
-                ]):
-                    continue
-
-                if re.search(r'[A-Za-z]', line):
-                    result["employer_name"] = line
-                    break
-
-    # --------------------------------------------------
-    # Resume-specific post processing
-    # --------------------------------------------------
-    if doc_type == "resume":
-
-        # Merge reliable regex header fields
-        if parsed:
-            if parsed.get("education"):
-                result["education"] = parsed["education"]
-            if parsed.get("experience"):
-                result["experience"] = parsed["experience"]
-            if not result.get("name"):
-                result["name"] = parsed.get("name")
-            if not result.get("email"):
-                result["email"] = parsed.get("email")
-
-            if not result.get("phone"):
-                result["phone"] = parsed.get("phone")
-
-            if not result.get("skills"):
-                result["skills"] = parsed.get("skills", [])
-
-        result = _normalize_resume_result(result)
-        if result.get("phone") is not None:
-            result["phone"] = str(result["phone"])
-
-        edu_empty = not result.get("education")
-        exp_empty = not result.get("experience")
-
-        # --------------------------------------------------
-        # Recovery pass for long resumes
-        # --------------------------------------------------
-        if edu_empty or exp_empty:
-
-            char_limit = CHAR_LIMITS.get("resume", 5000)
-
-            tail_candidates = [
-                raw_text[char_limit:],
-                raw_text[-4000:] if len(raw_text) > 4000 else ""
-            ]
-
-            for tail_text in tail_candidates:
-
-                if not tail_text.strip():
-                    continue
-
-                tail_res = _call_llm_for_edu_exp(tail_text)
-
-                if edu_empty and tail_res.get("education"):
-                    result["education"] = tail_res["education"]
-                    edu_empty = False
-
-                if exp_empty and tail_res.get("experience"):
-                    result["experience"] = tail_res["experience"]
-                    exp_empty = False
-
-                if not edu_empty and not exp_empty:
-                    break
-
-        result = _normalize_resume_result(result)
-
-    return result
-
-
-
-CHAR_LIMITS = {
-    "resume": 5000,
-    "payslip": 3000,
-    "experience_letter": 2000,
-    "degree_certificate": 2000,
-}
-
+# -----------------------------------------------------------------------
+# Main LLM call (used only for resume fields LLM needs to fill in)
+# -----------------------------------------------------------------------
 def _call_llm(raw_text: str, doc_type: str, schema: dict, strict: bool = False) -> dict:
     char_limit = CHAR_LIMITS.get(doc_type, 3000)
     text_chunk = raw_text[:char_limit]
-
-    extra_rules = ""
-
-    if doc_type == "payslip":
-        extra_rules = """
-IMPORTANT:
-- employer_name is the company issuing the payslip.
-- employee_name is the employee receiving the payslip.
-- pay_period must include BOTH month and year.
-- If the document contains 'March 2025', return exactly 'March 2025'.
-- Do NOT return only 'March'.
-- employer_name is usually displayed at the top of the payslip.
-- Do NOT confuse employer_name with employee_name.
-"""
 
     if strict:
         prompt = f"""Extract fields from this {doc_type}.
 Return ONLY a JSON object. Start your response with {{ and end with }}.
 No explanation, no markdown, no extra text.
-
-{extra_rules}
 
 Fields: {json.dumps(schema)}
 
@@ -903,8 +914,6 @@ TEXT:
 {text_chunk}"""
     else:
         prompt = f"""You are a document extraction system.
-
-{extra_rules}
 
 Extract fields from the following {doc_type} document.
 Return ONLY a valid JSON object with these fields:
@@ -934,6 +943,7 @@ DOCUMENT TEXT:
         return {"error": "ollama_not_running"}
     except Exception as e:
         return {"error": f"llm_error: {str(e)}"}
+
 
 def _call_llm_for_edu_exp(raw_text: str) -> dict:
     mini_schema = {
@@ -982,6 +992,7 @@ RESUME TEXT:
     except Exception:
         return {"education": [], "experience": []}
 
+
 def _parse_response(raw: str) -> dict:
     cleaned_raw = re.sub(r'(\d),(\d{3})\b', r'\1\2', raw)
     try:
@@ -1003,3 +1014,147 @@ def _parse_response(raw: str) -> dict:
         pass
 
     return {"error": "parse_failed", "raw": raw}
+
+
+# -----------------------------------------------------------------------
+# Main entry point
+# -----------------------------------------------------------------------
+def extract_with_llm(raw_text: str, doc_type: str, **kwargs) -> dict:
+    schema = SCHEMAS.get(doc_type)
+    if not schema:
+        return {
+            "doc_type": doc_type,
+            "error": f"No schema defined for doc_type: {doc_type}"
+        }
+
+    # --------------------------------------------------
+    # PAYSLIP: regex-first, LLM only as fallback
+    # --------------------------------------------------
+    if doc_type == "payslip":
+        page = kwargs.get("page", -1)
+        preprocessed = preprocess_payslip_text(raw_text, page=page)
+
+        uan = extract_uan_from_text(preprocessed)
+        if not uan:
+            uan = extract_uan_from_text(raw_text)  # try unprocessed too
+        if not uan:
+            uan = extract_uan_with_llm(preprocessed)  # LLM fallback
+
+        return {
+            "uan": uan,
+            "doc_type": "payslip",
+        }
+
+    # --------------------------------------------------
+    # RESUME: regex extraction first
+    # --------------------------------------------------
+    if doc_type == "resume":
+        parsed = extract_resume_sections(raw_text)
+
+        complete_regex = (
+            parsed.get("name")
+            and parsed.get("email")
+            and parsed.get("phone")
+            and parsed.get("skills")
+            and parsed.get("education")
+            and parsed.get("experience")
+        )
+        if complete_regex:
+            parsed["doc_type"] = "resume"
+            return _normalize_resume_result(parsed)
+
+        # LLM to fill gaps in non-complete resume extraction
+        result = _call_llm(raw_text, doc_type, schema)
+
+        if isinstance(result, dict) and result.get("error") == "parse_failed":
+            result = _call_llm(raw_text, doc_type, schema, strict=True)
+
+        if not isinstance(result, dict):
+            return {"doc_type": doc_type, "error": "llm_returned_non_dict"}
+
+        result["doc_type"] = doc_type
+
+        # Merge reliable regex fields over LLM fields
+        if parsed:
+            if parsed.get("education"):
+                result["education"] = parsed["education"]
+            if parsed.get("experience"):
+                result["experience"] = parsed["experience"]
+            if not result.get("name"):
+                result["name"] = parsed.get("name")
+            if not result.get("email"):
+                result["email"] = parsed.get("email")
+            if not result.get("phone"):
+                result["phone"] = parsed.get("phone")
+            if not result.get("skills"):
+                result["skills"] = parsed.get("skills", [])
+
+        # FIXED: recalculate IT experience on final merged experience list
+        exp_text = _slice_between_headings(
+            raw_text,
+            start_names=(r"EXPERIENCE", r"WORK EXPERIENCE", r"PROFESSIONAL EXPERIENCE",
+                         r"ROLES AND RESPONSIBILITIES"),
+            end_names=(r"SKILLS", r"SUMMARY OF SKILLS", r"EDUCATION", r"AWARDS",
+                       r"CERTIFICATES", r"HOBBIES")
+        )
+        it_years = _calculate_it_experience_from_entries(result.get("experience", []))
+        if it_years is None and exp_text:
+            it_years = _calculate_it_experience_with_llm(exp_text)
+        result["total_experience_years"] = it_years
+
+        result = _normalize_resume_result(result)
+        if result.get("phone") is not None:
+            result["phone"] = str(result["phone"])
+
+        # Recovery pass for long resumes with missing edu/exp
+        edu_empty = not result.get("education")
+        exp_empty = not result.get("experience")
+
+        if edu_empty or exp_empty:
+            char_limit = CHAR_LIMITS.get("resume", 5000)
+            tail_candidates = [
+                raw_text[char_limit:],
+                raw_text[-4000:] if len(raw_text) > 4000 else ""
+            ]
+
+            for tail_text in tail_candidates:
+                if not tail_text.strip():
+                    continue
+
+                tail_res = _call_llm_for_edu_exp(tail_text)
+
+                if edu_empty and tail_res.get("education"):
+                    result["education"] = tail_res["education"]
+                    edu_empty = False
+
+                if exp_empty and tail_res.get("experience"):
+                    result["experience"] = tail_res["experience"]
+                    exp_empty = False
+
+                if not edu_empty and not exp_empty:
+                    break
+
+        result = _normalize_resume_result(result)
+
+        # Keep only the fields callers need
+        return {
+            "name": result.get("name"),
+            "email": result.get("email"),
+            "phone": result.get("phone"),
+            "total_experience_years": result.get("total_experience_years"),
+            "doc_type": "resume",
+        }
+
+    # --------------------------------------------------
+    # Other doc types (experience_letter, degree_certificate)
+    # --------------------------------------------------
+    result = _call_llm(raw_text, doc_type, schema)
+
+    if isinstance(result, dict) and result.get("error") == "parse_failed":
+        result = _call_llm(raw_text, doc_type, schema, strict=True)
+
+    if not isinstance(result, dict):
+        return {"doc_type": doc_type, "error": "llm_returned_non_dict"}
+
+    result["doc_type"] = doc_type
+    return result

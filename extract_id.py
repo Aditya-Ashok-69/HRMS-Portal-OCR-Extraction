@@ -25,13 +25,12 @@ _paddle = PaddleOCR(
 
 def paddle_ocr_image(pil_image: Image.Image) -> str:
     img = pil_image.convert("RGB")
-    
-    # Ensure minimum size for PaddleOCR detection model
+
     w, h = img.size
     if h < 64 or w < 64:
         scale = max(64 / h, 64 / w)
         img = img.resize((int(w * scale) + 1, int(h * scale) + 1), Image.LANCZOS)
-    
+
     img_np = np.array(img)
     result = _paddle.ocr(img_np, cls=True)
     if not result or not result[0]:
@@ -40,32 +39,26 @@ def paddle_ocr_image(pil_image: Image.Image) -> str:
     return "\n".join(lines)
 
 def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
-    """
-    Deskew + adaptive threshold. Handles uneven lighting and slight rotation
-    that Tesseract/PaddleOCR both struggle with on phone-captured ID photos.
-    """
     img_np = np.array(pil_image.convert("RGB"))
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
-    # Deskew — find dominant text angle and correct it
-    coords = np.column_stack(np.where(gray < 200))  # dark pixels = text
+    coords = np.column_stack(np.where(gray < 200))
     if len(coords) > 100:
         angle = cv2.minAreaRect(coords)[-1]
         if angle < -45:
             angle = 90 + angle
-        if abs(angle) > 0.5:  # only rotate if skew is meaningful
+        if abs(angle) > 0.5:
             (h, w) = gray.shape
             M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
             gray = cv2.warpAffine(gray, M, (w, h),
                                   flags=cv2.INTER_CUBIC,
                                   borderMode=cv2.BORDER_REPLICATE)
 
-    # Adaptive threshold — much better than autocontrast for uneven lighting
     binary = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        blockSize=31,  # neighbourhood size — tune if needed
+        blockSize=31,
         C=10
     )
     return Image.fromarray(binary)
@@ -83,6 +76,7 @@ FATHER_REGEX = re.compile(
     re.IGNORECASE
 )
 DATE_REGEX = re.compile(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b")
+
 # ---------- spaCy ----------
 nlp = spacy.load("en_core_web_sm")
 
@@ -136,8 +130,6 @@ PIN_TERMINATOR_REGEX = re.compile(
 )
 
 def extract_text_from_pdf(pdf_path: str) -> str:
-    """Try native text extraction first (fast, accurate for digital PDFs).
-    Fall back to PaddleOCR only if native text is too short (scanned/image PDF)."""
     pdf = pdfium.PdfDocument(pdf_path)
     native_text = ""
     try:
@@ -148,9 +140,8 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         pdf.close()
 
     if len(native_text.strip()) > 50:
-        return native_text  # e-Aadhaar, digital PAN — no OCR needed
+        return native_text
 
-    # Scanned PDF — rasterize and run PaddleOCR
     pdf = pdfium.PdfDocument(pdf_path)
     all_text = []
     try:
@@ -165,13 +156,9 @@ def extract_text_from_pdf(pdf_path: str) -> str:
 
 def clean_line(line: str) -> str:
     line = line.strip()
-
     line = re.sub(r"^[^A-Za-z0-9]+", "", line)
-
     line = re.sub(r"^(?:bi|b1|i|l|1|2)\s+", "", line, flags=re.IGNORECASE)
-
     line = re.sub(r"\s+", " ", line)
-
     return line.strip()
 
 def normalize_ocr_text(text: str) -> str:
@@ -220,80 +207,6 @@ def likely_name(line: str) -> bool:
     return True
 
 
-def extract_name(lines):
-    cleaned = [clean_line(line) for line in lines if clean_line(line)]
-    for i, line in enumerate(cleaned):
-        if re.search(r"DOB|Date\s*of\s*Birth", line, re.IGNORECASE):
-            for j in range(max(0, i - 2), i):
-                candidate = cleaned[j]
-                if is_valid_english_name(candidate):
-                    return candidate
-    for i, line in enumerate(cleaned):
-        if line.strip().lower() == "to":
-            for j in range(i + 1, min(i + 4, len(cleaned))):
-                cand = cleaned[j]
-                if is_valid_english_name(cand) and "mobile" not in cand.lower():
-                    return cand
-
-    for i, line in enumerate(cleaned):
-        if re.search(r"^(S/O|D/O|C/O|W/O)\s*[:\-]?", line, re.IGNORECASE):
-            for j in range(max(0, i - 3), i):
-                cand = cleaned[j]
-                if is_valid_english_name(cand) and "mobile" not in cand.lower():
-                    return cand
-
-    for i, line in enumerate(cleaned):
-        if re.search(r"\b(DOB|MALE|FEMALE|OTHER|MOBILE|VID)\b", line, re.IGNORECASE):
-            for j in range(max(0, i - 3), i):
-                cand = cleaned[j]
-                if is_valid_english_name(cand) and "mobile" not in cand.lower():
-                    return cand
-
-    for line in cleaned:
-        if is_valid_english_name(line) and "mobile" not in line.lower():
-            return line
-
-    return None
-
-def extract_name_from_aadhaar_pdf(lines):
-
-    cleaned = [clean_line(x) for x in lines if clean_line(x)]
-
-    # Highest priority:
-    # Name immediately before DOB
-
-    for i, line in enumerate(cleaned):
-
-        if re.search(r"\bDOB\b", line, re.IGNORECASE):
-
-            for j in range(i - 1, max(-1, i - 5), -1):
-
-                cand = cleaned[j]
-
-                if is_valid_english_name(cand):
-
-                    if len(cand.split()) >= 2:
-
-                        return cand
-
-    # Name after TO
-
-    for i, line in enumerate(cleaned):
-
-        if line.strip().lower() == "to":
-
-            for j in range(i + 1, min(i + 6, len(cleaned))):
-
-                cand = cleaned[j]
-
-                if is_valid_english_name(cand):
-
-                    if len(cand.split()) >= 2:
-
-                        return cand
-
-    return None
-
 def is_valid_english_name(line: str) -> bool:
     s = clean_line(line)
     if not s:
@@ -330,6 +243,126 @@ def is_valid_english_name(line: str) -> bool:
         if len(words[0]) <= 3 and len(words[1]) <= 3:
             return False
     return good >= 1
+
+
+# -----------------------------------------------------------------------
+# FIXED: extract_name — used for Aadhaar front IMAGE
+# Strategy:
+#   1. Name labeled explicitly (e.g. "Name: Ravi Kumar") — highest trust
+#   2. Name on line immediately before DOB line
+#   3. Name on line immediately before S/O | D/O | W/O | C/O line
+#   4. Name after "To" block (printed Aadhaar letter format)
+#   5. Name before MALE/FEMALE/OTHER/MOBILE/VID keyword line
+#   6. Generic fallback scan
+# -----------------------------------------------------------------------
+def extract_name(lines):
+    cleaned = [clean_line(line) for line in lines if clean_line(line)]
+
+    # Pass 1: explicit "Name:" label on its own line, value follows
+    for i, line in enumerate(cleaned):
+        if re.fullmatch(r"(?:Name|Your\s+Name)\s*[:\-]?", line, re.IGNORECASE):
+            for j in range(i + 1, min(i + 3, len(cleaned))):
+                cand = cleaned[j]
+                if is_valid_english_name(cand) and len(cand.split()) >= 2:
+                    return cand
+
+    # Pass 2: "Name: Ravi Kumar" inline on same line
+    for line in cleaned:
+        m = re.match(r"^(?:Name|Your\s+Name)\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+        if m:
+            cand = clean_line(m.group(1))
+            if is_valid_english_name(cand) and len(cand.split()) >= 2:
+                return cand
+
+    # Pass 3: name immediately before DOB line (within 2 lines up)
+    for i, line in enumerate(cleaned):
+        if re.search(r"DOB|Date\s*of\s*Birth", line, re.IGNORECASE):
+            for j in range(max(0, i - 2), i):
+                candidate = cleaned[j]
+                if is_valid_english_name(candidate) and len(candidate.split()) >= 2:
+                    return candidate
+
+    # Pass 4: name immediately before S/O | D/O | W/O | C/O line (within 3 lines up)
+    for i, line in enumerate(cleaned):
+        if re.search(r"^(S/O|D/O|C/O|W/O)\s*[:\-]?", line, re.IGNORECASE):
+            for j in range(max(0, i - 3), i):
+                cand = cleaned[j]
+                if is_valid_english_name(cand) and len(cand.split()) >= 2:
+                    return cand
+
+    # Pass 5: name after "To" block (letter-format Aadhaar)
+    for i, line in enumerate(cleaned):
+        if line.strip().lower() == "to":
+            for j in range(i + 1, min(i + 4, len(cleaned))):
+                cand = cleaned[j]
+                if is_valid_english_name(cand) and "mobile" not in cand.lower():
+                    return cand
+
+    # Pass 6: name before MALE/FEMALE/OTHER/MOBILE/VID keyword (within 3 lines up)
+    for i, line in enumerate(cleaned):
+        if re.search(r"\b(DOB|MALE|FEMALE|OTHER|MOBILE|VID)\b", line, re.IGNORECASE):
+            for j in range(max(0, i - 3), i):
+                cand = cleaned[j]
+                if is_valid_english_name(cand) and "mobile" not in cand.lower():
+                    return cand
+
+    # Pass 7: generic scan — first line that looks like a valid name
+    for line in cleaned:
+        if is_valid_english_name(line) and "mobile" not in line.lower():
+            return line
+
+    return None
+
+
+# -----------------------------------------------------------------------
+# FIXED: extract_name_from_aadhaar_pdf
+# Digital/e-Aadhaar PDFs have cleaner text, so we can look for
+# the "Name:" label directly before falling back to position heuristics.
+# -----------------------------------------------------------------------
+def extract_name_from_aadhaar_pdf(lines):
+    cleaned = [clean_line(x) for x in lines if clean_line(x)]
+
+    # Pass 1: explicit "Name:" label — most reliable in digital PDFs
+    for i, line in enumerate(cleaned):
+        # Label on its own line, value on next line
+        if re.fullmatch(r"(?:Name|Your\s+Name)\s*[:\-]?", line, re.IGNORECASE):
+            for j in range(i + 1, min(i + 3, len(cleaned))):
+                cand = cleaned[j]
+                if is_valid_english_name(cand) and len(cand.split()) >= 2:
+                    return cand
+        # Label + value on same line: "Name: Ravi Kumar"
+        m = re.match(r"^(?:Name|Your\s+Name)\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+        if m:
+            cand = clean_line(m.group(1))
+            if is_valid_english_name(cand) and len(cand.split()) >= 2:
+                return cand
+
+    # Pass 2: name immediately before DOB line
+    for i, line in enumerate(cleaned):
+        if re.search(r"\bDOB\b", line, re.IGNORECASE):
+            for j in range(i - 1, max(-1, i - 5), -1):
+                cand = cleaned[j]
+                if is_valid_english_name(cand) and len(cand.split()) >= 2:
+                    return cand
+
+    # Pass 3: name before S/O | D/O | W/O | C/O line
+    for i, line in enumerate(cleaned):
+        if re.search(r"^(S/O|D/O|C/O|W/O)\s*[:\-]?", line, re.IGNORECASE):
+            for j in range(max(0, i - 3), i):
+                cand = cleaned[j]
+                if is_valid_english_name(cand) and len(cand.split()) >= 2:
+                    return cand
+
+    # Pass 4: name after "To" block
+    for i, line in enumerate(cleaned):
+        if line.strip().lower() == "to":
+            for j in range(i + 1, min(i + 6, len(cleaned))):
+                cand = cleaned[j]
+                if is_valid_english_name(cand) and len(cand.split()) >= 2:
+                    return cand
+
+    return None
+
 
 def extract_dob(text: str):
     m = DOB_KEYWORD_REGEX.search(text)
@@ -435,7 +468,6 @@ def extract_address(lines):
         if not s:
             continue
 
-        # Start only from Address section
         if not collecting and re.search(
             r"^\s*Address\s*:?",
             s,
@@ -444,8 +476,6 @@ def extract_address(lines):
             collecting = True
             address_lines = []
 
-            # Handle:
-            # Address:S/O:Kuppan,NO
             s = re.sub(
                 r"^\s*Address\s*:?",
                 "",
@@ -478,14 +508,12 @@ def extract_address(lines):
         if not s:
             continue
 
-        # OCR garbage
         if s.lower() in {"mq", "q", "oq"}:
             continue
 
         if re.fullmatch(r"[A-Za-z]{1,2}\.?", s):
             continue
 
-        # Remove S/O father-name prefix
         if re.match(r"^(S/O|D/O|C/O|W/O)\b", s, re.IGNORECASE):
             s = re.sub(
                 r"^(?:S/O|D/O|C/O|W/O)\s*:?\s*[^,]+,\s*",
@@ -497,8 +525,6 @@ def extract_address(lines):
             if not s.strip():
                 continue
 
-        # Merge:
-        # NO
         if (
             address_lines
             and address_lines[-1].upper() == "NO"
@@ -509,7 +535,6 @@ def extract_address(lines):
 
         address_lines.append(s)
 
-        # Stop after state+pincode line
         if (
             STATE_PIN_REGEX.search(s)
             or re.search(
@@ -529,7 +554,6 @@ def extract_address(lines):
 
     address = ", ".join(address_lines)
 
-    # Remove locality duplication seen in OCR
     address = re.sub(
         r"\bVengathur\s*,?\s*Manavalanagar\b",
         "",
@@ -562,40 +586,17 @@ def clean_aadhaar_address(address):
     if not address:
         return address
 
-    address = re.sub(
-        r"\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b",
-        "",
-        address
-    )
-
-    address = re.sub(
-        r"\b\d{9,}\b",
-        "",
-        address
-    )
-
-    address = re.sub(
-        r"\b(?:uidai|uidal)\.gov\.in\b",
-        "",
-        address,
-        flags=re.IGNORECASE
-    )
-
-    address = re.sub(
-        r"\b\d{6}\s+\d+\b",
-        "",
-        address
-    )
-
+    address = re.sub(r"\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b", "", address)
+    address = re.sub(r"\b\d{9,}\b", "", address)
+    address = re.sub(r"\b(?:uidai|uidal)\.gov\.in\b", "", address, flags=re.IGNORECASE)
+    address = re.sub(r"\b\d{6}\s+\d+\b", "", address)
     address = re.sub(
         r"\b(?:S/O|D/O|C/O|W/O)\s*:?\s*[^,]+,?",
         "",
         address,
         flags=re.IGNORECASE
     )
-
     address = re.sub(r"\s+", " ", address)
-
     address = re.sub(r"\s*,\s*", ", ", address)
 
     return address.strip(" ,.-")
@@ -717,35 +718,13 @@ def best_pan_dob(image_path: str):
     return crop_dob or full_dob
 
 def choose_dob(raw_text: str, candidates: list[str]) -> str | None:
-    """Pick the most reliable DOB from candidates.
-    Prefer dates that appear near a DOB keyword in the raw text."""
     if not candidates:
         return None
     for cand in candidates:
-        # Check if this date appears near a DOB label in the text
         pattern = rf"(?:DOB|Date\s*of\s*Birth)[^\d]{{0,20}}{re.escape(cand)}"
         if re.search(pattern, raw_text, re.IGNORECASE):
             return cand
-    return candidates[0]  # fallback: return first found
-
-def looks_like_person_name(text):
-    words = text.split()
-
-    if not (2 <= len(words) <= 4):
-        return False
-
-    for w in words:
-        w = re.sub(r"[^A-Za-z]", "", w)
-
-        if len(w) < 2:
-            return False
-
-        vowels = sum(ch.lower() in "aeiou" for ch in w)
-
-        if vowels == 0:
-            return False
-
-    return True
+    return candidates[0]
 
 def looks_like_person_name(text):
     if not text:
@@ -755,7 +734,6 @@ def looks_like_person_name(text):
 
     words = text.split()
 
-    # PAN names usually have 2-4 words
     if len(words) < 2 or len(words) > 4:
         return False
 
@@ -788,7 +766,6 @@ def looks_like_person_name(text):
 
 def extract_from_pan_image(image_path: str):
     d = openbharatocr.pan(image_path)
-    print(json.dumps(d, indent=2, ensure_ascii=False))
 
     ocr_text = d.get("raw_text")
 
@@ -805,9 +782,7 @@ def extract_from_pan_image(image_path: str):
 
     compact_text = re.sub(r"\s+", " ", ocr_text).strip()
 
-    # -----------------------------
-    # PAN
-    # -----------------------------
+    # PAN number
     pan = (
         d.get("pan_number")
         or d.get("PAN Number")
@@ -817,27 +792,24 @@ def extract_from_pan_image(image_path: str):
         pan_matches = PAN_REGEX.findall(compact_text)
         pan = pan_matches[0] if pan_matches else None
 
-    # -----------------------------
-    # HIGH CONFIDENCE (Library)
-    # -----------------------------
+    # Name — library first
     name = (
         d.get("name")
         or d.get("Full Name")
     )
 
+    # Father name — library first
     father_name = (
         d.get("father_name")
         or d.get("Parent's Name")
     )
 
+    # DOB — library first, then regex
     dob = (
         d.get("dob")
         or d.get("Date of Birth")
     )
 
-    # -----------------------------
-    # DOB FALLBACK
-    # -----------------------------
     if not dob:
         dob_match = DATE_REGEX.search(compact_text)
         dob = dob_match.group(1) if dob_match else None
@@ -845,9 +817,7 @@ def extract_from_pan_image(image_path: str):
     if not dob:
         dob = best_pan_dob(image_path)
 
-    # -----------------------------
-    # OCR CLEANUP
-    # -----------------------------
+    # Fix common OCR misread of "Father's Name:" label
     ocr_text = re.sub(
         r"\bme:\s*",
         "Father's Name: ",
@@ -855,9 +825,7 @@ def extract_from_pan_image(image_path: str):
         flags=re.IGNORECASE
     )
 
-    # -----------------------------
-    # FATHER NAME REGEX FALLBACK
-    # -----------------------------
+    # Father name regex fallback
     if not father_name:
         m = re.search(
             r"Father.?s Name\s*:\s*([A-Za-z ]+)",
@@ -871,9 +839,7 @@ def extract_from_pan_image(image_path: str):
             if looks_like_person_name(extracted):
                 father_name = extracted
 
-    # -----------------------------
-    # CANDIDATE HEURISTICS
-    # -----------------------------
+    # Candidate heuristics when library failed
     if not name or not father_name:
 
         PAN_NOISE = [
@@ -927,9 +893,6 @@ def extract_from_pan_image(image_path: str):
             if 1 < len(words) <= 4:
                 candidates.append(line)
 
-        print("LINES:", lines)
-        print("CANDIDATES:", candidates)
-
         valid_candidates = [
             c for c in candidates
             if looks_like_person_name(c)
@@ -941,9 +904,7 @@ def extract_from_pan_image(image_path: str):
         if not father_name and len(valid_candidates) >= 2:
             father_name = valid_candidates[1]
 
-    # -----------------------------
-    # LLM FALLBACK
-    # -----------------------------
+    # Flat-text inference as last resort
     if not name or not father_name:
 
         inferred_name, inferred_father = (
@@ -968,44 +929,11 @@ def extract_from_pan_image(image_path: str):
         ):
             father_name = inferred_father
 
-    print(repr(ocr_text))
-    print("RAW OCR TEXT:")
-    print(ocr_text)
-
-    print("PAN FOUND:", pan)
-    print("DOB FOUND:", dob)
     return {
         "name": name,
         "father_name": father_name,
-        "dob": dob,
-        "address": None,
         "pan": pan,
-        "aadhaar": None,
         "doc_type": "pan_image",
-        "raw_text": ocr_text,
-        "_meta": {
-            "aadhaar_source":
-                "library"
-                if d.get("aadhaar_number")
-                else "regex_fallback",
-
-            "name_source":
-                "library"
-                if d.get("name") or d.get("Full Name")
-                else "crop_heuristic"
-                if name
-                else "not_found",
-
-            "low_confidence_fields": [
-                k
-                for k, v in {
-                    "name": name,
-                    "dob": dob,
-                    "aadhaar": None
-                }.items()
-                if not v
-            ]
-        }
     }
 
 
@@ -1015,11 +943,6 @@ def extract_from_pan_pdf(pdf_path: str):
 
     pan_matches = PAN_REGEX.findall(raw_text)
     pan = pan_matches[0] if pan_matches else None
-
-    dob = None
-    dob_match = DATE_REGEX.search(raw_text)
-    if dob_match:
-        dob = dob_match.group(1)
 
     filtered = []
     for ln in lines:
@@ -1051,17 +974,8 @@ def extract_from_pan_pdf(pdf_path: str):
     return {
         "name": name,
         "father_name": father_name,
-        "dob": dob,
-        "address": None,
         "pan": pan,
-        "aadhaar": None,
         "doc_type": "pan_pdf",
-        "raw_text": raw_text,
-        "_meta": {
-            "low_confidence_fields": [
-            k for k, v in {"name": name, "dob": dob, "aadhaar": None}.items() if not v
-            ]
-        }
     }
 
 def split_aadhaar_combined_image(image_path: str):
@@ -1111,11 +1025,9 @@ def extract_from_aadhaar_image(image_path: str):
     w, h = img.size
     ratio = w / h
 
-    # side-by-side combined image
     if ratio > 1.6:
         return extract_from_aadhaar_combined_image(image_path)
 
-    # top-bottom combined image
     if ratio < 0.9:
         return extract_from_aadhaar_vertical_combined_image(image_path)
 
@@ -1134,7 +1046,7 @@ def split_aadhaar_vertical_combined_image(image_path: str):
 
     for y in range(search_top, search_bottom):
         row = [gray.getpixel((x, y)) for x in range(0, w, max(1, w // 200))]
-        score = sum(row) / len(row)  # brighter row = more likely separator/background
+        score = sum(row) / len(row)
         if best_score is None or score > best_score:
             best_score = score
             best_y = y
@@ -1151,10 +1063,6 @@ def score_aadhaar_result(r):
         score += 2
     if r.get("dob"):
         score += 2
-    if r.get("gender"):
-        score += 1
-    if r.get("address"):
-        score += 3
     if r.get("aadhaar"):
         score += 2
     return score
@@ -1224,6 +1132,7 @@ def extract_from_aadhaar_front_image(image_path: str):
     if father_match:
         father_name = clean_line(father_match.group(1))
 
+    # Name — try library first, then crop, then line-based heuristic
     name = d.get("name")
     dob = d.get("dob")
     gender = extract_gender_from_aadhaar_front_crop(image_path)
@@ -1242,18 +1151,31 @@ def extract_from_aadhaar_front_image(image_path: str):
         dob_match = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", compact_wo_aadhaar)
         if dob_match:
             dob = dob_match.group(1)
+
+    # FIXED: more structured name resolution
     if not name:
         name = extract_name_from_aadhaar_front_crop(image_path)
+
     if name:
-        name_low = name.lower()
-        if any(x in name_low for x in ["mobile", "mobile no", "dob", "vid", "male", "female", "other"]):
+        bad_name_terms = [
+            "mobile", "mobile no", "dob", "male", "female",
+            "other", "address", "vid", "government", "india"
+        ]
+        if any(term in name.lower() for term in bad_name_terms):
             name = None
+
     if not name:
-        name = extract_name(lines)
+        name = extract_name(lines)  # now uses the improved multi-pass function
+
     if name:
-        name_low = name.lower()
-        if any(x in name_low for x in ["mobile", "mobile no", "dob", "vid", "male", "female", "other"]):
+        bad_name_terms = [
+            "mobile", "mobile no", "dob", "male", "female",
+            "other", "address", "vid", "government", "india"
+        ]
+        if any(term in name.lower() for term in bad_name_terms):
             name = None
+
+    # Last resort: reconstruct from remaining alpha tokens
     if not name:
         work = compact_wo_aadhaar
         if dob:
@@ -1267,6 +1189,7 @@ def extract_from_aadhaar_front_image(image_path: str):
         words = [w for w in work.split() if re.fullmatch(r"[A-Za-z]+", w)]
         if 1 <= len(words) <= 4:
             name = " ".join(words[:2]) if len(words) >= 2 else words[0]
+
     name = normalize_person_name(name)
     if name:
         bad_name_terms = [
@@ -1275,28 +1198,20 @@ def extract_from_aadhaar_front_image(image_path: str):
         ]
         if any(term in name.lower() for term in bad_name_terms):
             name = None
+
     father_name = normalize_person_name(father_name)
     if name:
         name = re.sub(r"\b(?:MALE|FEMALE|OTHER)\b", "", name, flags=re.IGNORECASE)
         name = re.sub(r"\s+", " ", name).strip()
+
     return {
         "name": name,
         "father_name": father_name,
         "dob": dob,
-        "gender": gender,
-        "address": None,
-        "pan": None,
         "aadhaar": aadhaar,
         "doc_type": "aadhaar_front_image",
-        "raw_text": raw_text,
-        "_meta": {
-            "aadhaar_source": "library" if d.get("aadhaar_number") else "regex_fallback",
-            "name_source": "library" if d.get("name") else "crop_heuristic" if name else "not_found",
-            "low_confidence_fields": [
-                k for k, v in {"name": name, "dob": dob, "aadhaar": aadhaar}.items() if not v
-            ]
-        }
-
+        # keep raw_text internally for merge; stripped from final output
+        "_raw_text": raw_text,
     }
 
 
@@ -1334,7 +1249,7 @@ def extract_from_aadhaar_back_image(image_path: str):
             if len(digits) == 12:
                 aadhaar = f"{digits[:4]} {digits[4:8]} {digits[8:12]}"
 
-    # Father name
+    # Father name from back image
     father_name = d.get("father_name")
     if not father_name:
         m = re.search(
@@ -1345,71 +1260,22 @@ def extract_from_aadhaar_back_image(image_path: str):
         if m:
             father_name = clean_line(m.group(1))
 
-    # Address
-    address = d.get("address")
-
-    if not address:
-        m = re.search(
-            r"\b(?:S/O|D/O|C/O|W/O)\s*[:\-]?\s*[A-Za-z ]+,\s*(.+?\b\d{6}\b)",
-            compact,
-            re.IGNORECASE
-        )
-        if m:
-            address = m.group(1).strip()
-
-    if not address:
-        m = re.search(
-            r"\bAddress\s*:\s*(.+?\b\d{6}\b)",
-            compact,
-            re.IGNORECASE
-        )
-        if m:
-            address = m.group(1).strip()
-
-    if address:
-        address = remove_relationship_prefix(address)
-        address = re.sub(r"\b9183\s*0074\s*6619\b", "", address)
-        address = re.sub(r"\.{2,}", ".", address)
-        address = re.sub(r"\s*,\s*", ", ", address)
-        address = re.sub(r"\s+", " ", address).strip(" ,.-")
-        address = re.sub(r"\s*\.\s*", " ", address)
-        address = re.sub(r",\s*,+", ", ", address)
-        address = re.sub(r"\s*-\s*,", ", ", address)
-        address = re.sub(r",\s*-", " - ", address)
-        address = re.sub(r"\b,\s*\.\s*,\b", ", ", address)
-        address = re.sub(r"\s+", " ", address).strip(" ,.-")
-    if address:
-        address = re.sub(r"\s*-\s*Bihar\s*-\s*821115", " Bihar - 821115", address, flags=re.IGNORECASE)
-        address = re.sub(r"\s+", " ", address).strip(" ,.-")
     return {
-        "name": None,
+        "name": None,          # back side has no name
         "father_name": father_name,
         "dob": None,
-        "gender": None,
-        "address": address,
-        "pan": None,
         "aadhaar": aadhaar,
         "doc_type": "aadhaar_back_image",
-        "raw_text": raw_text,
-        "_meta": {
-            "aadhaar_source": "library" if d.get("aadhaar_number") else "regex_fallback",
-            "address_source": "library" if d.get("address") else "regex" if address else "not_found",
-            "low_confidence_fields": [
-                k for k, v in {"father_name": father_name, "address": address, "aadhaar": aadhaar}.items() if not v
-            ]
-        }
+        "_raw_text": raw_text,
     }
 
-import re
 
 def extract_from_aadhaar_pdf(pdf_path: str):
     raw_text = extract_text_from_pdf(pdf_path)
     raw_text = normalize_ocr_text(raw_text)
     lines = [line for line in raw_text.splitlines() if line.strip()]
 
-    # -----------------------------
-    # Aadhaar extraction
-    # -----------------------------
+    # Aadhaar number — strip VID first to avoid false match
     clean_text = re.sub(
         r"VID\s*[:\-]?\s*\d[\d\s]{12,}",
         "",
@@ -1417,12 +1283,7 @@ def extract_from_aadhaar_pdf(pdf_path: str):
         flags=re.IGNORECASE
     )
 
-    aadhaar_candidates = re.findall(
-        r"\d{4}\s?\d{4}\s?\d{4}",
-        clean_text
-    )
-
-    # keep only valid 12-digit candidates
+    aadhaar_candidates = re.findall(r"\d{4}\s?\d{4}\s?\d{4}", clean_text)
     aadhaar_candidates = [
         c
         for c in aadhaar_candidates
@@ -1433,17 +1294,12 @@ def extract_from_aadhaar_pdf(pdf_path: str):
     best_score = -1
 
     for cand in aadhaar_candidates:
-
         digits = re.sub(r"\D", "", cand)
-
-        # Aadhaar never starts with 0 or 1
         if digits[0] in "01":
             continue
 
         score = 0
 
-        # strongest signal:
-        # Aadhaar number appearing near Aadhaar label
         if re.search(
             rf"(?:Your\s+Aadhaar\s+No|Aadhaar\s+No|Aadhaar)[^\d]{{0,40}}{re.escape(cand)}",
             raw_text,
@@ -1451,13 +1307,9 @@ def extract_from_aadhaar_pdf(pdf_path: str):
         ):
             score += 20
 
-        # appears multiple times
         score += raw_text.count(cand) * 3
-
-        # appears as plain digits too
         score += raw_text.count(digits)
 
-        # appears near DOB section
         if re.search(
             rf"DOB.*?{re.escape(cand)}",
             raw_text,
@@ -1469,67 +1321,30 @@ def extract_from_aadhaar_pdf(pdf_path: str):
             best_score = score
             aadhaar = f"{digits[:4]} {digits[4:8]} {digits[8:]}"
 
-    # -----------------------------
     # Father name
-    # -----------------------------
     father_name = None
     father_match = FATHER_REGEX.search(raw_text)
     if father_match:
         father_name = clean_line(father_match.group(1))
 
-    # -----------------------------
-    # Name / DOB / Gender
-    # -----------------------------
+    # FIXED: use improved PDF-specific name extractor
     name = extract_name_from_aadhaar_pdf(lines)
     dob = extract_dob(raw_text)
-    gender = extract_gender(raw_text)
 
-    # -----------------------------
-    # Address
-    # -----------------------------
-    address = extract_address(lines)
-    if address:
-        address = remove_relationship_prefix(address)
-        address = clean_aadhaar_address(address)
-
-    # -----------------------------
-    # Final validation (extra safety)
-    # -----------------------------
+    # Final validation
     if aadhaar:
         digits = re.sub(r"\D", "", aadhaar)
-
-        # Aadhaar should not start with 0 or 1
         if digits[0] in "01":
             aadhaar = None
 
-    # -----------------------------
-    # Output
-    # -----------------------------
-    result = {
+    return {
         "name": name,
         "father_name": father_name,
         "dob": dob,
-        "gender": gender,
-        "address": address,
-        "pan": None,
         "aadhaar": aadhaar,
         "doc_type": "aadhaar_pdf",
-        "raw_text": raw_text,
-        "_meta": {
-            "aadhaar_source": "regex" if aadhaar else "not_found",
-            "name_source": "heuristic" if name else "not_found",
-            "low_confidence_fields": [
-                k for k, v in {
-                    "name": name,
-                    "dob": dob,
-                    "aadhaar": aadhaar,
-                    "address": address
-                }.items() if not v
-            ]
-        }
     }
 
-    return result
 
 def merge_aadhaar_results(front_result=None, back_result=None):
     front_result = front_result or {}
@@ -1539,12 +1354,10 @@ def merge_aadhaar_results(front_result=None, back_result=None):
         "name": front_result.get("name") or back_result.get("name"),
         "father_name": front_result.get("father_name") or back_result.get("father_name"),
         "dob": front_result.get("dob") or back_result.get("dob"),
-        "gender": front_result.get("gender") or back_result.get("gender"),
-        "address": back_result.get("address") or front_result.get("address"),
-        "pan": None,
         "aadhaar": front_result.get("aadhaar") or back_result.get("aadhaar"),
         "doc_type": "aadhaar",
     }
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1578,7 +1391,7 @@ def main():
         if not args.file:
             parser.error("--file is required for aadhaar_image")
         path = str(Path(args.file).resolve())
-        result = extract_from_aadhaar_image(path)  # ← this now routes correctly
+        result = extract_from_aadhaar_image(path)
 
     elif args.doc_type == "aadhaar_pdf":
         if not args.file:
@@ -1604,6 +1417,7 @@ def main():
         result = merge_aadhaar_results(front_result, back_result)
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
 
 if __name__ == "__main__":
     main()
