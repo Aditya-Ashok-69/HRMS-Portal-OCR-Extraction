@@ -291,6 +291,22 @@ def _calculate_it_experience_from_entries(experience: list[dict]) -> float | Non
     return round(total_months / 12, 1)
 
 
+def _calculate_it_experience_with_company_fallback(experience: list) -> float | None:
+    """
+    When keyword matching finds no IT roles but entries with durations exist,
+    pass them to the LLM with company context to decide.
+    """
+    if not experience:
+        return None
+    fallback_text = "\n".join(
+        f"{e.get('role', '')} at {e.get('company', '')} ({e.get('duration', '')})"
+        for e in experience if e.get("duration")
+    )
+    if not fallback_text.strip():
+        return None
+    return _calculate_it_experience_with_llm(fallback_text)
+
+
 def _calculate_it_experience_with_llm(exp_text: str) -> float | None:
     """
     LLM fallback for IT experience calculation when regex parsing fails.
@@ -398,11 +414,14 @@ def extract_resume_sections(text: str) -> dict:
     exp_text = _slice_between_headings(
         text,
         start_names=(r"EXPERIENCE", r"WORK EXPERIENCE", r"PROFESSIONAL EXPERIENCE",
+                     r"EMPLOYMENT HISTORY", r"EMPLOYMENT", r"CAREER HISTORY",
                      r"ROLES AND RESPONSIBILITIES"),
         end_names=(r"SKILLS", r"SUMMARY OF SKILLS", r"EDUCATION", r"AWARDS",
                    r"CERTIFICATES", r"HOBBIES")
     )
     exp_list = _extract_experience(exp_text) if exp_text else []
+    if not exp_list and exp_text:
+        exp_list = _extract_experience_blocks(exp_text)
 
     if not edu_list:
         edu_list = _extract_education(text)
@@ -415,6 +434,8 @@ def extract_resume_sections(text: str) -> dict:
 
     # FIXED: IT-only experience calculation — try structured parsing first
     it_years = _calculate_it_experience_from_entries(result["experience"])
+    if it_years is None and result["experience"]:
+        it_years = _calculate_it_experience_with_company_fallback(result["experience"])
     if it_years is None and exp_text:
         # Fallback to LLM only when structured parsing yielded nothing
         it_years = _calculate_it_experience_with_llm(exp_text)
@@ -456,7 +477,12 @@ def _extract_contact(text: str) -> dict:
     email_match = re.search(r'[\w.+-]+@[\w-]+\.[a-z]{2,}', text, re.IGNORECASE)
     email = email_match.group(0) if email_match else None
 
-    phone_match = re.search(r'(?:\+91[\s-]?)?[6-9]\d{9}', text)
+    phone_match = re.search(
+        r'(?:\+?91[-.\s]?)?(?:\(?0\)?[-.\s]?)?[6-9]\d{9}'
+        r'|'
+        r'\b[6-9]\d{2}[-.\s]\d{3}[-.\s]\d{4}\b',
+        text
+    )
     phone = phone_match.group(0) if phone_match else None
 
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -586,7 +612,8 @@ def _slice_between_headings(text: str, start_names: tuple, end_names: tuple) -> 
     lines = text.splitlines()
     start = None
     for i, line in enumerate(lines):
-        if any(re.fullmatch(p, line.strip(), re.IGNORECASE) for p in start_names):
+        stripped = line.strip().rstrip(":")
+        if any(re.search(rf"^{p}$", stripped, re.IGNORECASE) for p in start_names):
             start = i + 1
             break
     if start is None:
@@ -594,8 +621,9 @@ def _slice_between_headings(text: str, start_names: tuple, end_names: tuple) -> 
 
     end = len(lines)
     for j in range(start, len(lines)):
-        if _is_heading(lines[j]) and not any(re.fullmatch(p, lines[j].strip(), re.IGNORECASE) for p in start_names):
-            if any(re.fullmatch(p, lines[j].strip(), re.IGNORECASE) for p in end_names):
+        stripped_j = lines[j].strip().rstrip(":")
+        if _is_heading(lines[j]) and not any(re.search(rf"^{p}$", stripped_j, re.IGNORECASE) for p in start_names):
+            if any(re.search(rf"^{p}$", stripped_j, re.IGNORECASE) for p in end_names):
                 end = j
                 break
     return "\n".join(lines[start:end]).strip()
@@ -757,9 +785,11 @@ def _extract_experience(exp_text: str) -> list:
     lines = [l.strip() for l in exp_text.splitlines() if l.strip()]
 
     date_pattern = re.compile(
-        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}|\d{4})'
+        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+        r'[a-z]*\.?[\s-]+\d{4}|\d{4})'
         r'\s*[-–]\s*'
-        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}|\d{4}|Present|present|Current|current)',
+        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+        r'[a-z]*\.?[\s-]+\d{4}|\d{4}|Present|present|Current|current)',
         re.IGNORECASE
     )
 
@@ -768,6 +798,23 @@ def _extract_experience(exp_text: str) -> list:
             continue
 
         date_match = date_pattern.search(line)
+
+        if not date_match and i + 1 < len(lines):
+            next_line = lines[i + 1]
+            next_date_match = date_pattern.search(next_line)
+
+            if next_date_match and "|" in line:
+                parts = [p.strip() for p in line.split("|") if p.strip()]
+
+                company = parts[0] if len(parts) > 0 else None
+                role = parts[1] if len(parts) > 1 else None
+
+                entries.append({
+                    "company": company,
+                    "role": role,
+                    "duration": next_date_match.group(0).strip()
+                })
+            continue
         multi_matches = re.findall(
             r'([A-Za-z &]+?)\s*\|\s*([A-Za-z ,/&-]+?)\s*\|\s*'
             r'((?:19|20)\d{2}.*?(?:Present|Current|(?:19|20)\d{2}))',
@@ -820,6 +867,43 @@ def _extract_experience(exp_text: str) -> list:
             "duration": duration
         })
 
+    return _clean_experience_list(entries)
+
+
+def _extract_experience_blocks(exp_text: str) -> list:
+    """
+    Block-based experience parser for multi-line resume formats where company,
+    role, and dates appear on separate lines rather than pipe-separated on one line.
+    Used as fallback when _extract_experience returns an empty list.
+    """
+    date_pat = re.compile(
+        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{4}|\d{4})'
+        r'\s*[-–to]+\s*'
+        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{4}'
+        r'|\d{4}|Present|present|Current|current|Till\s*Date|till\s*date)',
+        re.IGNORECASE
+    )
+    blocks = re.split(r'\n{2,}', exp_text.strip())
+    entries = []
+    for block in blocks:
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
+        if not lines:
+            continue
+        duration = None
+        for line in lines:
+            m = date_pat.search(line)
+            if m:
+                duration = m.group(0).strip()
+                break
+        if not duration:
+            continue
+        non_date_lines = [l for l in lines if not date_pat.search(l)
+                          and not l.startswith(('-', '•', '●', '\uf0b7'))]
+        company = non_date_lines[0] if non_date_lines else None
+        role = non_date_lines[1] if len(non_date_lines) > 1 else None
+        if company and _IT_ROLE_KEYWORDS.search(company) and role:
+            company, role = role, company
+        entries.append({"company": company, "role": role, "duration": duration})
     return _clean_experience_list(entries)
 
 
@@ -998,9 +1082,31 @@ def _clean_experience_list(exp_list: list) -> list:
 # -----------------------------------------------------------------------
 # Main LLM call (used only for resume fields LLM needs to fill in)
 # -----------------------------------------------------------------------
+def _build_resume_prompt_text(raw_text: str, max_chars: int = 5000) -> str:
+    """
+    Build LLM prompt text for resumes by combining the header (name/contact)
+    with the experience section, instead of blindly truncating from the start.
+    Experience sections in long resumes are often cut off by a naive [:5000] slice.
+    """
+    header = raw_text[:1500]
+    exp_section = _slice_between_headings(
+        raw_text,
+        start_names=(r"EXPERIENCE", r"WORK EXPERIENCE", r"PROFESSIONAL EXPERIENCE",
+                     r"EMPLOYMENT HISTORY", r"EMPLOYMENT", r"CAREER HISTORY",
+                     r"ROLES AND RESPONSIBILITIES"),
+        end_names=(r"EDUCATION", r"SKILLS", r"SUMMARY OF SKILLS", r"AWARDS",
+                   r"PROJECTS", r"CERTIFICATIONS", r"HOBBIES")
+    )
+    remainder_budget = max_chars - len(header)
+    return header + "\n\n" + exp_section[:remainder_budget]
+
+
 def _call_llm(raw_text: str, doc_type: str, schema: dict, strict: bool = False) -> dict:
     char_limit = CHAR_LIMITS.get(doc_type, 3000)
-    text_chunk = raw_text[:char_limit]
+    if doc_type == "resume":
+        text_chunk = _build_resume_prompt_text(raw_text, max_chars=char_limit)
+    else:
+        text_chunk = raw_text[:char_limit]
 
     if strict:
         prompt = f"""Extract fields from this {doc_type}.
@@ -1165,11 +1271,14 @@ def extract_with_llm(raw_text: str, doc_type: str, **kwargs) -> dict:
                 exp_text_c = _slice_between_headings(
                     raw_text,
                     start_names=(r"EXPERIENCE", r"WORK EXPERIENCE", r"PROFESSIONAL EXPERIENCE",
+                                 r"EMPLOYMENT HISTORY", r"EMPLOYMENT", r"CAREER HISTORY",
                                  r"ROLES AND RESPONSIBILITIES", r"Professional Experience"),
                     end_names=(r"SKILLS", r"SUMMARY OF SKILLS", r"EDUCATION", r"AWARDS",
                                r"CERTIFICATES", r"HOBBIES")
                 )
                 it_c = _calculate_it_experience_from_entries(parsed["experience"])
+                if it_c is None and parsed["experience"]:
+                    it_c = _calculate_it_experience_with_company_fallback(parsed["experience"])
                 if it_c is None and exp_text_c:
                     it_c = _calculate_it_experience_with_llm(exp_text_c)
                 parsed["total_experience_years"] = it_c
@@ -1212,6 +1321,7 @@ def extract_with_llm(raw_text: str, doc_type: str, **kwargs) -> dict:
         exp_text = _slice_between_headings(
             raw_text,
             start_names=(r"EXPERIENCE", r"WORK EXPERIENCE", r"PROFESSIONAL EXPERIENCE",
+                         r"EMPLOYMENT HISTORY", r"EMPLOYMENT", r"CAREER HISTORY",
                          r"ROLES AND RESPONSIBILITIES", r"Professional Experience"),
             end_names=(r"SKILLS", r"SUMMARY OF SKILLS", r"EDUCATION", r"AWARDS",
                        r"CERTIFICATES", r"HOBBIES")
@@ -1219,6 +1329,8 @@ def extract_with_llm(raw_text: str, doc_type: str, **kwargs) -> dict:
         # Always prefer regex-parsed experience for IT year calculation
         exp_entries = result.get("experience") or []
         it_years = _calculate_it_experience_from_entries(exp_entries)
+        if it_years is None and exp_entries:
+            it_years = _calculate_it_experience_with_company_fallback(exp_entries)
         if it_years is None and exp_text:
             it_years = _calculate_it_experience_with_llm(exp_text)
         result["total_experience_years"] = it_years
