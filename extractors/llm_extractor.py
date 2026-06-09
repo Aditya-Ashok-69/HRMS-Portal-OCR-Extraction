@@ -113,7 +113,20 @@ _IT_ROLE_KEYWORDS = re.compile(
     r"test\s*engineer|mobile\s*developer|android|ios\s*developer|"
     r"database\s*admin|dba|system\s*admin|network\s*engineer|"
     r"it\s*support|technical\s*support|solutions\s*architect|"
-    r"scrum|agile|product\s*manager|tech\s*lead|engineering\s*manager"
+    r"scrum|agile|product\s*manager|tech\s*lead|engineering\s*manager|"
+    r"3d\s*artist|3d\s*generalist|3d\s*specialist|3d\s*lead|3d\s*consultant|"
+    r"3d\s*technical|technical\s*specialist|technical\s*lead|"
+    r"unity|unreal|vr|ar|xr|mixed\s*reality|augmented\s*reality|"
+    r"visuali[sz]ation|animator|animation|rendering|technical\s*artist|"
+    r"ui\s*ux|ux\s*designer|ui\s*designer|graphic\s*designer|"
+    r"game\s*developer|game\s*designer|level\s*designer|"
+    r"it\s*specialist|it\s*consultant|it\s*manager|it\s*analyst|"
+    r"systems\s*engineer|integration\s*engineer|automation\s*engineer|"
+    r"embedded\s*engineer|firmware|hardware\s*engineer|"
+    r"security\s*engineer|cybersecurity|penetration\s*tester|"
+    r"data\s*engineer|etl|bi\s*developer|business\s*intelligence|"
+    r"salesforce|sap\s*consultant|erp|crm\s*developer|"
+    r"scrum\s*master|agile\s*coach|release\s*engineer"
     r")\b",
     re.IGNORECASE
 )
@@ -141,6 +154,9 @@ def _parse_duration_to_months(duration: str) -> int | None:
     """
     if not duration:
         return None
+
+    # LLM sometimes returns duration as a list e.g. ["Jan 2021", "Mar 2023"]
+    # or as an int/float — normalise to string before any processing
     if isinstance(duration, list):
         duration = " - ".join(str(x) for x in duration if x)
     elif not isinstance(duration, str):
@@ -166,10 +182,11 @@ def _parse_duration_to_months(duration: str) -> int | None:
     }
 
     # Regex for "Mon YYYY – Mon YYYY/Present"
+    # Also handles "Mon-YYYY" (hyphen between month and year)
     range_pat = re.compile(
-        r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?)\s*(\d{4})"
+        r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?)[\s-]*(\d{4})"
         r"\s*[-–]\s*"
-        r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{4}|Present|Current|Now)",
+        r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?[\s-]*\d{4}|Present|Current|Now)",
         re.IGNORECASE
     )
     rm = range_pat.search(duration)
@@ -181,7 +198,7 @@ def _parse_duration_to_months(duration: str) -> int | None:
             end_dt = datetime.today()
         else:
             ep = re.match(
-                r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*(\d{4})",
+                r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?[\s-]*(\d{4})",
                 end_str,
                 re.IGNORECASE
             )
@@ -205,6 +222,34 @@ def _parse_duration_to_months(duration: str) -> int | None:
         end_y = datetime.today().year if end_str in ("present", "current") else int(end_str)
         return max(0, (end_y - start_y) * 12)
 
+    # "to till date", "to date", "till date", "to present" etc.
+    present_pat = re.compile(
+        r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?[\s-]*\d{4}|\d{4})"
+        r"\s+(?:to\s+)?(?:till\s+)?(?:date|present|now|current)",
+        re.IGNORECASE
+    )
+    pm = present_pat.search(duration)
+    if pm:
+        start_str = pm.group(1).strip()
+        ep2 = re.match(
+            r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)[\s-]*(\d{4})",
+            start_str, re.IGNORECASE
+        )
+        if ep2:
+            month_map2 = {
+                "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12
+            }
+            sm = month_map2.get(ep2.group(1)[:3].lower(), 1)
+            sy = int(ep2.group(2))
+            start_dt2 = datetime(sy, sm, 1)
+            diff2 = relativedelta(datetime.today(), start_dt2)
+            return diff2.years * 12 + diff2.months
+        else:
+            yr_m = re.search(r"\d{4}", start_str)
+            if yr_m:
+                return max(0, (datetime.today().year - int(yr_m.group(0))) * 12)
+
     return None
 
 
@@ -217,6 +262,8 @@ def _calculate_it_experience_from_entries(experience: list[dict]) -> float | Non
     found_any = False
 
     for entry in experience:
+        if not isinstance(entry, dict):
+            continue
         role = entry.get("role") or ""
         company = entry.get("company") or ""
         duration = entry.get("duration") or ""
@@ -417,7 +464,18 @@ def _extract_contact(text: str) -> dict:
     heading_words = {
         "PROFILE", "CONTACT", "SUMMARY", "SUMMARY OF SKILLS",
         "SKILLS", "TECHNICAL SKILLS", "STRENGTH", "HOBBIES",
-        "EDUCATION", "EXPERIENCE", "WORK EXPERIENCE"
+        "EDUCATION", "EXPERIENCE", "WORK EXPERIENCE",
+        "AWARDS", "PROJECTS", "CERTIFICATIONS", "OBJECTIVE",
+        "KEY SKILLS", "PROFESSIONAL SUMMARY", "ROLES AND RESPONSIBILITIES",
+    }
+
+    # Section headings that should never be treated as names
+    _NEVER_A_NAME = {
+        "PROFILE", "CONTACT", "SUMMARY", "SKILLS", "TECHNICAL SKILLS",
+        "STRENGTH", "HOBBIES", "EDUCATION", "EXPERIENCE", "WORK EXPERIENCE",
+        "AWARDS", "PROJECTS", "CERTIFICATIONS", "OBJECTIVE", "KEY SKILLS",
+        "PROFESSIONAL SUMMARY", "ROLES AND RESPONSIBILITIES",
+        "SUMMARY OF SKILLS",
     }
 
     def is_heading(line: str) -> bool:
@@ -425,13 +483,15 @@ def _extract_contact(text: str) -> dict:
         return upper in heading_words or upper.rstrip(':') in heading_words
 
     def is_strong_name(line: str) -> bool:
+        if line.strip().upper() in _NEVER_A_NAME:
+            return False
         if any(ch.isdigit() for ch in line):
             return False
         low = line.lower()
         if any(x in low for x in (
             "@", "http", "www.", "linkedin",
-            "developer", "engineer", "analyst",
-            "consultant", "manager", "lead"
+            "specialist", "consultant", "manager", "lead",
+            "analyst", "developer", "engineer",
         )):
             return False
         words = [w for w in line.split() if w]
@@ -441,25 +501,57 @@ def _extract_contact(text: str) -> dict:
 
     name = None
 
+    # Pass 1: lines before the first section heading (standard resume layout)
     header_lines = []
     for line in lines:
         if is_heading(line):
             break
         header_lines.append(line)
-    if header_lines:
-        candidate = header_lines[0].strip()
+    for candidate in header_lines:
+        candidate = candidate.strip()
         if is_strong_name(candidate):
             name = candidate
+            break
 
+    # Pass 2: scan ALL lines for a name-shaped line.
+    # Needed for PDFs where name appears AFTER section headings in text order
+    # (e.g. side-panel layout where left column is extracted after right column).
+    # A "name-shaped" line: 1-4 words, all purely alphabetic words, not a heading,
+    # not a job title blurb, reasonably short.
     if not name:
+        def _looks_like_name(line: str) -> bool:
+            s = line.strip()
+            if s.upper() in _NEVER_A_NAME:
+                return False
+            if any(ch.isdigit() for ch in s):
+                return False
+            low = s.lower()
+            if any(x in low for x in (
+                "@", "http", "www.", "linkedin",
+                "specialist", "consultant", "manager", "lead",
+                "analyst", "developer", "engineer",
+                "driven", "professional", "experience", "result",
+                "dedicated", "motivated", "passionate", "objective",
+            )):
+                return False
+            words = [w for w in s.split() if w]
+            if not (1 <= len(words) <= 4):
+                return False
+            # All words must be purely alphabetic (names don't have symbols)
+            if not all(re.fullmatch(r"[A-Za-z]+", w) for w in words):
+                return False
+            # At least one word must be >= 3 chars (avoids initials-only lines)
+            if not any(len(w) >= 3 for w in words):
+                return False
+            # Prefer Title Case or ALL CAPS names, not random mixed case
+            title_or_caps = all(
+                w[0].isupper() for w in words
+            )
+            return title_or_caps
+
         for line in lines:
-            low = line.lower()
-            if any(x in low for x in ['@', 'http', 'www.', 'linkedin']):
-                continue
-            if re.search(r'(?:\+?\d[\d\s-]{6,})', line):
-                continue
-            if len(re.findall(r'[A-Za-z]', line)) >= 4 and len(line) <= 70:
-                name = line
+            if _looks_like_name(line):
+                name = line.strip()
                 break
     if name:
         name = re.sub(
@@ -842,9 +934,16 @@ def _clean_experience_list(exp_list: list) -> list:
         if not isinstance(entry, dict):
             continue
 
-        company = (entry.get("company") or "").strip()
-        role = (entry.get("role") or "").strip()
-        duration = (entry.get("duration") or "").strip()
+        def _to_str(val) -> str:
+            if val is None:
+                return ""
+            if isinstance(val, list):
+                return " ".join(str(x) for x in val if x).strip()
+            return str(val).strip()
+
+        company  = _to_str(entry.get("company"))
+        role     = _to_str(entry.get("role"))
+        duration = _to_str(entry.get("duration"))
 
         if role and role.upper().startswith("WORK EXPERIENCE"):
             role = ""
@@ -1061,7 +1160,27 @@ def extract_with_llm(raw_text: str, doc_type: str, **kwargs) -> dict:
         )
         if complete_regex:
             parsed["doc_type"] = "resume"
-            return _normalize_resume_result(parsed)
+            # Ensure IT experience is always calculated from structured data, never skipped
+            if parsed.get("total_experience_years") is None and parsed.get("experience"):
+                exp_text_c = _slice_between_headings(
+                    raw_text,
+                    start_names=(r"EXPERIENCE", r"WORK EXPERIENCE", r"PROFESSIONAL EXPERIENCE",
+                                 r"ROLES AND RESPONSIBILITIES", r"Professional Experience"),
+                    end_names=(r"SKILLS", r"SUMMARY OF SKILLS", r"EDUCATION", r"AWARDS",
+                               r"CERTIFICATES", r"HOBBIES")
+                )
+                it_c = _calculate_it_experience_from_entries(parsed["experience"])
+                if it_c is None and exp_text_c:
+                    it_c = _calculate_it_experience_with_llm(exp_text_c)
+                parsed["total_experience_years"] = it_c
+            result_c = _normalize_resume_result(parsed)
+            return {
+                "name": result_c.get("name"),
+                "email": result_c.get("email"),
+                "phone": result_c.get("phone"),
+                "total_experience_years": result_c.get("total_experience_years"),
+                "doc_type": "resume",
+            }
 
         # LLM to fill gaps in non-complete resume extraction
         result = _call_llm(raw_text, doc_type, schema)
@@ -1093,11 +1212,13 @@ def extract_with_llm(raw_text: str, doc_type: str, **kwargs) -> dict:
         exp_text = _slice_between_headings(
             raw_text,
             start_names=(r"EXPERIENCE", r"WORK EXPERIENCE", r"PROFESSIONAL EXPERIENCE",
-                         r"ROLES AND RESPONSIBILITIES"),
+                         r"ROLES AND RESPONSIBILITIES", r"Professional Experience"),
             end_names=(r"SKILLS", r"SUMMARY OF SKILLS", r"EDUCATION", r"AWARDS",
                        r"CERTIFICATES", r"HOBBIES")
         )
-        it_years = _calculate_it_experience_from_entries(result.get("experience", []))
+        # Always prefer regex-parsed experience for IT year calculation
+        exp_entries = result.get("experience") or []
+        it_years = _calculate_it_experience_from_entries(exp_entries)
         if it_years is None and exp_text:
             it_years = _calculate_it_experience_with_llm(exp_text)
         result["total_experience_years"] = it_years
